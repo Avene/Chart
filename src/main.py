@@ -1,17 +1,31 @@
 import os
+import logging
+import json
 import requests
 import pandas as pd
 import mplfinance as mpf
+import google.auth
+from google.auth.credentials import Credentials
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google import genai
 from dotenv import load_dotenv
 
 # .env を読み込む
 load_dotenv()
 
+# --- ログ設定 ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # --- 設定 ---
 STOCK_CODE = '79740'  # J-Quantsは末尾0が必要な場合が多い
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 JQUANTS_API_KEY = os.getenv('JQUANTS_API_KEY')
+PROMPT_URI = os.getenv('PROMPT_URI')
 
 # --- 1. J-Quants データ取得 (簡易版) ---
 def get_stock_data(code: str, days: int = 180) -> pd.DataFrame:
@@ -62,38 +76,116 @@ def create_chart(df: pd.DataFrame, filename: str) -> str:
     # style='yahoo' や 'binance' など選べます
     mpf.plot(df, type='candle', mav=(5, 20, 75), volume=True, 
              style='yahoo', savefig=filename)
-    print(f"✅ チャート保存完了: {filename}")
+    logger.info(f"✅ チャート保存完了: {filename}")
 
     return filename
 
+def get_drive_credentials() -> Credentials:
+    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+    # 1. Service Account (環境変数) - CI/CD用
+    sa_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception:
+            pass
+
+    # 2. ADC (gcloud auth application-default login) へのフォールバック
+    # ローカル開発(gcloud CLI) や GCP環境(Cloud Run等) で有効
+    creds, _ = google.auth.default(scopes=SCOPES)
+        
+    return creds
+
+# --- プロンプト取得 ---
+def get_external_prompt(uri: str | None) -> str:
+    default_prompt = "この株価チャート（日足）を見て、スイングトレード視点で分析してください。移動平均線は20日です。"
+    
+    if not uri:
+        return default_prompt
+        
+    target_url = uri
+    headers = {}
+    auth_email = None
+    
+    # Google Docsの場合、テキストエクスポートURLに変換
+    if "docs.google.com/document/d/" in uri:
+        try:
+            # 認証情報の取得を試みる (非公開ドキュメント対応)
+            try:
+                creds = get_drive_credentials()
+                if hasattr(creds, 'service_account_email'):
+                    auth_email = creds.service_account_email
+                
+                creds.refresh(GoogleAuthRequest())
+                headers['Authorization'] = f'Bearer {creds.token}'
+            except Exception:
+                logger.warning('Failed to Authenticate to Google Docs. Trying public access...')
+
+        except IndexError:
+            logger.error(f"Failed to fetch prompt from Google Docs: {uri}")
+            logger.info("Using default prompt.")
+            return default_prompt
+
+    try:
+        # https://docs.google.com/document/d/DOC_ID/edit... -> DOC_ID
+        doc_id = uri.split('/d/')[1].split('/')[0]
+        target_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"            
+        response = requests.get(target_url, headers=headers)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            logger.error(f"⛔ 403 Forbidden: Google Docへのアクセス権限がありません。")
+            if auth_email:
+                logger.info(f"👉 このメールアドレスをGoogle Docの「共有」に追加してください: {auth_email}")
+            else:
+                logger.info("👉 ドキュメントが公開されているか、認証情報が正しいか確認してください。")
+        else:
+            logger.error(f"⚠️ プロンプトの取得に失敗しました (HTTP {e.response.status_code}): {e}")
+        logger.info("Using default prompt.")
+        return default_prompt
+    except Exception as e:
+        logger.error(f"⚠️ プロンプトの取得に失敗しました: {e}")
+        logger.info("Using default prompt.")
+        return default_prompt
+
 # --- 3. Gemini 分析 ---
 def analyze_chart(image_path: str) -> str:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # タイムアウトを延長 (WinError 10053対策: 5分)
+    # google-genaiの仕様に合わせて整数(ミリ秒想定)で指定: 300000 = 5分
+    timeout_ms = 300000
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options={'timeout': timeout_ms})
     
-    img = client.files.upload(file=image_path)
-    
-    prompt = "この株価チャート（日足）を見て、スイングトレード視点で分析してください。移動平均線は20日です。"
-    response = client.models.generate_content(
-        model='gemini-3-flash-preview', contents=[prompt, img]
-    )
-    
-    return response.text
+    try:
+        # アップロード時にも設定を適用
+        img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
+        
+        prompt = get_external_prompt(PROMPT_URI)
+        response = client.models.generate_content(
+            model='gemini-3-flash-preview', contents=[prompt, img]
+        )
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini API Error: {e}")
+        return "分析中にエラーが発生しました。"
 
 # --- メイン実行 ---
 if __name__ == "__main__":
     # 1. データ取得
-    print("データ取得中...")
-    df = get_stock_data(STOCK_CODE)  # J-Quantsからデータ取得に切り替えた場合はこちらを有効化
+    logger.info("データ取得中...")
+    df = get_stock_data(STOCK_CODE)
 
     # 2. チャート作成
     chart_path = 'output/chart.png'
     if os.path.exists(chart_path):
         os.remove(chart_path)
-    print("チャート作成中...")  
+    logger.info("チャート作成中...")  
     create_chart(df, chart_path)
 
     # 3. 分析
-    print("Gemini分析中...")
+    logger.info("Gemini分析中...")
     result = analyze_chart(chart_path)
     
     print("\n" + "="*30)
