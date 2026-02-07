@@ -173,6 +173,9 @@ def analyze_chart(image_path: str) -> str:
 
 # --- メイン実行 ---
 if __name__ == "__main__":
+    # 出力ディレクトリを作成 (CI環境用)
+    os.makedirs('output', exist_ok=True)
+
     # 1. データ取得
     logger.info("データ取得中...")
     df = get_stock_data(STOCK_CODE)

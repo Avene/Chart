@@ -1,0 +1,38 @@
+name: Daily Stock Analysis
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+  schedule:
+    # Run at 23:00 UTC (08:00 JST) every weekday (Mon-Fri)
+    - cron: '0 23 * * 0-4'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run analysis
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          PROMPT_URI: ${{ secrets.PROMPT_URI }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: uv run src/main.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-result
+          path: output/
