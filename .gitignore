@@ -14,6 +14,11 @@ venv/
 env/
 ENV/
 
+# --- ビルド・パッケージ配布用 (uv buildなどで生成) ---
+dist/
+build/
+*.egg-info/
+
 # --- VS Code 設定 (個人の設定は共有しない) ---
 .vscode/
 *.code-workspace
@@ -22,7 +27,7 @@ ENV/
 *.png
 *.jpg
 *.csv
-output/
+output/*
 
 # --- ログファイルなど ---
 *.log
