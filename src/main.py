@@ -10,6 +10,7 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google import genai
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
 # .env を読み込む
 load_dotenv()
@@ -151,6 +152,18 @@ def get_external_prompt(uri: str | None) -> str:
         logger.info("Using default prompt.")
         return default_prompt
 
+# --- Gemini API リトライ用関数 ---
+# 503エラー (Overloaded) 対策: 指数バックオフでリトライ (4s, 8s, 16s... 最大60s待機, 5回試行)
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    before_sleep=before_sleep_log(logger, logging.INFO)
+)
+def generate_content_with_retry(client, model, contents):
+    return client.models.generate_content(
+        model=model, contents=contents
+    )
+
 # --- 3. Gemini 分析 ---
 def analyze_chart(image_path: str) -> str:
     # タイムアウトを延長 (WinError 10053対策: 5分)
@@ -163,9 +176,7 @@ def analyze_chart(image_path: str) -> str:
         img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
         
         prompt = get_external_prompt(PROMPT_URI)
-        response = client.models.generate_content(
-            model='gemini-3-flash-preview', contents=[prompt, img]
-        )
+        response = generate_content_with_retry(client, 'gemini-3-flash-preview', [prompt, img])
         return response.text
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")

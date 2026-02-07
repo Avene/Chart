@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # Allows manual trigger from GitHub UI
   schedule:
     # Run at 23:00 UTC (08:00 JST) every weekday (Mon-Fri)
-    - cron: '0 23 * * 0-4'
+    - cron: '0 23 * * 0-6'
 
 jobs:
   analyze:
