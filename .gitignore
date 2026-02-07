@@ -1,0 +1,28 @@
+# --- 機密情報 (絶対にコミットしない！) ---
+.env
+.env.local
+api_keys.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 仮想環境 (サイズが巨大なので除外) ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- VS Code 設定 (個人の設定は共有しない) ---
+.vscode/
+*.code-workspace
+
+# --- 出力ファイル (生成されるチャート画像など) ---
+*.png
+*.jpg
+*.csv
+output/
+
+# --- ログファイルなど ---
+*.log
