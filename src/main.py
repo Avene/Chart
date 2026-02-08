@@ -77,6 +77,18 @@ def get_stock_data(code: str, days: int = 1825) -> pd.DataFrame:
 def add_technical_indicators(df: pd.DataFrame, periods: list[int]) -> pd.DataFrame:
     for p in periods:
         df[f'MA{p}'] = df['Close'].rolling(window=p).mean()
+    
+    # ボリンジャーバンド (±2σ, ±3σ)
+    # 中心線は指定された期間の2番目(中期線)を使用、なければ20
+    bb_period = periods[1] if len(periods) > 1 else 20
+    sma = df['Close'].rolling(window=bb_period).mean()
+    std = df['Close'].rolling(window=bb_period).std()
+    df['BB_UP_1'] = sma + (1 * std)
+    df['BB_LOW_1'] = sma - (1 * std)
+    df['BB_UP'] = sma + (2 * std)
+    df['BB_LOW'] = sma - (2 * std)
+    df['BB_UP_3'] = sma + (3 * std)
+    df['BB_LOW_3'] = sma - (3 * std)
     return df
 
 # --- 2. チャート作成 (mplfinance) ---
@@ -95,9 +107,32 @@ def create_chart(df: pd.DataFrame, filename: str, title: str) -> str:
             color = colors[i % len(colors)]
             ap.append(mpf.make_addplot(df[col], color=color, width=1.0))
     
+    # ボリンジャーバンド描画
+    bb1_line_color = "#EFB2D8"
+    bb2_line_color = "#DC72B5"
+    bb3_line_color = "#BA358A"
+    
+    bb_line_base_style = dict(width=0.6, alpha=0.8, linestyle='dashdot')
+
+    if 'BB_UP_1' in df.columns and not df['BB_UP_1'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_UP_1'], color=bb1_line_color, **bb_line_base_style))
+    if 'BB_LOW_1' in df.columns and not df['BB_LOW_1'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_LOW_1'], color=bb1_line_color, **bb_line_base_style))
+    if 'BB_UP' in df.columns and not df['BB_UP'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_UP'], color=bb2_line_color, **bb_line_base_style))
+    if 'BB_LOW' in df.columns and not df['BB_LOW'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_LOW'], color=bb2_line_color, **bb_line_base_style))
+    if 'BB_UP_3' in df.columns and not df['BB_UP_3'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_UP_3'], color=bb3_line_color, **bb_line_base_style))
+    if 'BB_LOW_3' in df.columns and not df['BB_LOW_3'].isna().all():
+        ap.append(mpf.make_addplot(df['BB_LOW_3'], color=bb3_line_color, **bb_line_base_style))
+  
     # volume=True で出来高表示
     # type='candle' でローソク足
-    kwargs = {'addplot': ap} if ap else {}
+    kwargs = {}
+    if ap:
+        kwargs['addplot'] = ap
+
     mpf.plot(df, type='candle', volume=True, style='yahoo', savefig=filename, title=title, **kwargs)
     logger.info(f"✅ チャート保存完了: {filename}")
 
@@ -246,7 +281,7 @@ if __name__ == "__main__":
         create_chart(d, path, title)
         chart_paths.append(path)
 
-    # 3. 分析
+    3. 分析
     logger.info("Gemini分析中...")
     result = analyze_chart(chart_paths)
     
