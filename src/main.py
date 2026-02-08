@@ -281,7 +281,7 @@ if __name__ == "__main__":
         create_chart(d, path, title)
         chart_paths.append(path)
 
-    3. 分析
+    # 3. 分析
     logger.info("Gemini分析中...")
     result = analyze_chart(chart_paths)
     
