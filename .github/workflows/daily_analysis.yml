@@ -29,6 +29,8 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PROMPT_URI: ${{ secrets.PROMPT_URI }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_MODEL_NAME: ${{ vars.GEMINI_MODEL_NAME }}
+
         run: uv run src/main.py
 
       - name: Upload results
