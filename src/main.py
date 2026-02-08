@@ -176,6 +176,7 @@ def analyze_chart(image_path: str) -> str:
         # アップロード時にも設定を適用
         img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
         
+        logger.info(f'Using prompt: {PROMPT_URI}')
         prompt = get_external_prompt(PROMPT_URI)
         logger.info(f'Using model: {GEMINI_MODEL_NAME}')
         response = generate_content_with_retry(client, GEMINI_MODEL_NAME, [prompt, img])
