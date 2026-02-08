@@ -177,7 +177,7 @@ def analyze_chart(image_path: str) -> str:
         img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
         
         prompt = get_external_prompt(PROMPT_URI)
-        response = generate_content_with_retry(client, GEMINI_MODEL_NAME, [prompt, img])
+        response = generate_content_with_retry(client, 'gemini-3-flash-preview', [prompt, img])
         return response.text
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
