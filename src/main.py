@@ -27,6 +27,7 @@ STOCK_CODE = '79740'  # J-Quantsは末尾0が必要な場合が多い
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 JQUANTS_API_KEY = os.getenv('JQUANTS_API_KEY')
 PROMPT_URI = os.getenv('PROMPT_URI')
+GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
 
 # --- 1. J-Quants データ取得 (簡易版) ---
 def get_stock_data(code: str, days: int = 180) -> pd.DataFrame:
@@ -176,7 +177,7 @@ def analyze_chart(image_path: str) -> str:
         img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
         
         prompt = get_external_prompt(PROMPT_URI)
-        response = generate_content_with_retry(client, 'gemini-3-flash-preview', [prompt, img])
+        response = generate_content_with_retry(client, GEMINI_MODEL_NAME, [prompt, img])
         return response.text
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
