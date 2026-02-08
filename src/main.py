@@ -29,6 +29,9 @@ JQUANTS_API_KEY = os.getenv('JQUANTS_API_KEY')
 PROMPT_URI = os.getenv('PROMPT_URI')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
 
+logger.info(f'model name : {os.getenv("GEMINI_MODEL_NAME")}')
+
+
 # --- 1. J-Quants データ取得 (簡易版) ---
 def get_stock_data(code: str, days: int = 180) -> pd.DataFrame:
     # データ取得 (過去100日分)
