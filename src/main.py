@@ -33,13 +33,14 @@ logger.info(f'model name : {os.getenv("GEMINI_MODEL_NAME")}')
 
 
 # --- 1. J-Quants データ取得 (簡易版) ---
-def get_stock_data(code: str, days: int = 180) -> pd.DataFrame:
-    # データ取得 (過去100日分)
+def get_stock_data(code: str, days: int = 1825) -> pd.DataFrame:
+    # データ取得 (デフォルト過去5年分に短縮: API制限回避)
     # V2 URL (コードは5桁推奨)
     code5 = code if len(code) == 5 else code + '0'
     headers = {'x-api-key': JQUANTS_API_KEY} 
-    from_date = (pd.Timestamp.now() - pd.Timedelta(days=270)).strftime('%Y-%m-%d')
-    to_date = (pd.Timestamp.now() - pd.Timedelta(days=150)).strftime('%Y-%m-%d')
+    base_date = pd.Timestamp.now()
+    from_date = (base_date - pd.Timedelta(days=days)).strftime('%Y-%m-%d')
+    to_date = base_date.strftime('%Y-%m-%d')
     params = {
         'code': code5,
         'from': from_date,
@@ -64,23 +65,40 @@ def get_stock_data(code: str, days: int = 180) -> pd.DataFrame:
     df = df.set_index('Date').sort_index()
     
     # 数値型に変換
-    cols = ['O', 'H', 'L', 'C', 'Vo']
+    cols = ['AdjO', 'AdjH', 'AdjL', 'AdjC', 'AdjVo']
     df[cols] = df[cols].astype(float)
     
     # mplfinance用にカラム名を変更
-    df = df.rename(columns={'O': 'Open', 'H': 'High', 'L': 'Low', 'C': 'Close', 'Vo': 'Volume'})
+    df = df.rename(columns={'AdjO': 'Open', 'AdjH': 'High', 'AdjL': 'Low', 'AdjC': 'Close', 'AdjVo': 'Volume'})
     
-    return df.tail(days) 
+    return df
+
+# --- テクニカル指標追加 (MA計算) ---
+def add_technical_indicators(df: pd.DataFrame, periods: list[int]) -> pd.DataFrame:
+    for p in periods:
+        df[f'MA{p}'] = df['Close'].rolling(window=p).mean()
+    return df
 
 # --- 2. チャート作成 (mplfinance) ---
-def create_chart(df: pd.DataFrame, filename: str) -> str:
+def create_chart(df: pd.DataFrame, filename: str, title: str) -> str:
     # スタイル指定でプロっぽいチャートに
-    # mav=(5, 20, 75) で移動平均線を3本描画
+    # addplotで計算済みのMAを描画 (mav引数だと表示期間のみで計算されてしまうため)
+    ap = []
+    
+    # MAカラムを抽出して期間順にソート
+    ma_cols = sorted([c for c in df.columns if c.startswith('MA')], key=lambda x: int(x[2:]))
+    colors = ['orange', 'blue', 'green']
+    
+    for i, col in enumerate(ma_cols):
+        if not df[col].isna().all():
+            # 色は期間が短い順に Orange, Blue, Green を割り当て
+            color = colors[i % len(colors)]
+            ap.append(mpf.make_addplot(df[col], color=color, width=1.0))
+    
     # volume=True で出来高表示
     # type='candle' でローソク足
-    # style='yahoo' や 'binance' など選べます
-    mpf.plot(df, type='candle', mav=(5, 20, 75), volume=True, 
-             style='yahoo', savefig=filename)
+    kwargs = {'addplot': ap} if ap else {}
+    mpf.plot(df, type='candle', volume=True, style='yahoo', savefig=filename, title=title, **kwargs)
     logger.info(f"✅ チャート保存完了: {filename}")
 
     return filename
@@ -105,7 +123,7 @@ def get_drive_credentials() -> Credentials:
 
 # --- プロンプト取得 ---
 def get_external_prompt(uri: str | None) -> str:
-    default_prompt = "この株価チャート（日足）を見て、スイングトレード視点で分析してください。移動平均線は20日です。"
+    default_prompt = "これらの株価チャート（日足・週足・月足）を見て、スイングトレード視点で分析してください。"
     
     if not uri:
         return default_prompt
@@ -169,20 +187,22 @@ def generate_content_with_retry(client, model, contents):
     )
 
 # --- 3. Gemini 分析 ---
-def analyze_chart(image_path: str) -> str:
+def analyze_chart(image_paths: list[str]) -> str:
     # タイムアウトを延長 (WinError 10053対策: 5分)
     # google-genaiの仕様に合わせて整数(ミリ秒想定)で指定: 300000 = 5分
     timeout_ms = 300000
     client = genai.Client(api_key=GEMINI_API_KEY, http_options={'timeout': timeout_ms})
     
     try:
-        # アップロード時にも設定を適用
-        img = client.files.upload(file=image_path, config={'http_options': {'timeout': timeout_ms}})
+        # 画像をアップロード
+        imgs = []
+        for path in image_paths:
+            imgs.append(client.files.upload(file=path, config={'http_options': {'timeout': timeout_ms}}))
         
         logger.info(f'Using prompt: {PROMPT_URI}')
         prompt = get_external_prompt(PROMPT_URI)
         logger.info(f'Using model: {GEMINI_MODEL_NAME}')
-        response = generate_content_with_retry(client, GEMINI_MODEL_NAME, [prompt, img])
+        response = generate_content_with_retry(client, GEMINI_MODEL_NAME, [prompt] + imgs)
         return response.text
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
@@ -197,16 +217,38 @@ if __name__ == "__main__":
     logger.info("データ取得中...")
     df = get_stock_data(STOCK_CODE)
 
-    # 2. チャート作成
-    chart_path = 'output/chart.png'
-    if os.path.exists(chart_path):
-        os.remove(chart_path)
+    # データ加工 (日足・週足・月足)
+    # 日足: 直近6ヶ月 (約130営業日)
+    df_daily = add_technical_indicators(df.copy(), [5, 25, 75])
+    df_daily = df_daily.tail(130)
+    
+    # 週足: 直近24ヶ月 (約104週)
+    df_weekly = df.resample('W-FRI').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+    df_weekly = add_technical_indicators(df_weekly, [13, 26, 52])
+    df_weekly = df_weekly.tail(104)
+    
+    # 月足: 直近60ヶ月
+    df_monthly = df.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+    df_monthly = add_technical_indicators(df_monthly, [9, 24])
+    df_monthly = df_monthly.tail(60)
+
+    # 2. チャート作成 (3種類)
+    chart_paths = []
+    charts_config = [
+        (df_daily, 'output/chart_daily.png', 'Daily Chart'),
+        (df_weekly, 'output/chart_weekly.png', 'Weekly Chart'),
+        (df_monthly, 'output/chart_monthly.png', 'Monthly Chart')
+    ]
+
     logger.info("チャート作成中...")  
-    create_chart(df, chart_path)
+    for d, path, title in charts_config:
+        if os.path.exists(path): os.remove(path)
+        create_chart(d, path, title)
+        chart_paths.append(path)
 
     # 3. 分析
     logger.info("Gemini分析中...")
-    result = analyze_chart(chart_path)
+    result = analyze_chart(chart_paths)
     
     print("\n" + "="*30)
     print(result)
