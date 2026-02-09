@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import io
 import requests
 import pandas as pd
 import mplfinance as mpf
@@ -28,6 +29,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 JQUANTS_API_KEY = os.getenv('JQUANTS_API_KEY')
 PROMPT_URI = os.getenv('PROMPT_URI')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
+STOCK_LIST_SHEET_URL = os.getenv('STOCK_LIST_SHEET_URL')
 
 logger.info(f'model name : {os.getenv("GEMINI_MODEL_NAME")}')
 
@@ -73,6 +75,25 @@ def get_stock_data(code: str, days: int = 1825) -> pd.DataFrame:
     
     return df
 
+# --- 銘柄情報取得 ---
+def get_stock_name(code: str) -> str:
+    # V2 URL (コードは5桁推奨)
+    code5 = code if len(code) == 5 else code + '0'
+    headers = {'x-api-key': JQUANTS_API_KEY}
+    url = "https://api.jquants.com/v2/equities/master"
+    params = {"code": code5}
+    
+    try:
+        res = requests.get(url, params=params, headers=headers)
+        res.raise_for_status()
+        data = res.json()
+        if "data" in data and len(data["data"]) > 0:
+            return data['data'][0]['CoNameEn']
+    except Exception as e:
+        logger.warning(f"Failed to get stock info for {code}: {e}")
+    
+    return code
+
 # --- テクニカル指標追加 (MA計算) ---
 def add_technical_indicators(df: pd.DataFrame, periods: list[int]) -> pd.DataFrame:
     for p in periods:
@@ -90,6 +111,40 @@ def add_technical_indicators(df: pd.DataFrame, periods: list[int]) -> pd.DataFra
     df['BB_UP_3'] = sma + (3 * std)
     df['BB_LOW_3'] = sma - (3 * std)
     return df
+
+# --- Google Auth (Prompt/Sheet取得用) ---
+def get_drive_credentials() -> Credentials:
+    # 読み取り専用スコープで十分
+    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+    # 1. Service Account (環境変数) - CI/CD用
+    sa_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception:
+            pass
+
+    # 2. ADC (gcloud auth application-default login) へのフォールバック
+    creds, _ = google.auth.default(scopes=SCOPES)
+        
+    return creds
+
+def get_google_auth_headers() -> tuple[dict, str | None]:
+    headers = {}
+    email = None
+    try:
+        creds = get_drive_credentials()
+        if hasattr(creds, 'service_account_email'):
+            email = creds.service_account_email
+        
+        # トークンリフレッシュ
+        creds.refresh(GoogleAuthRequest())
+        headers['Authorization'] = f'Bearer {creds.token}'
+    except Exception as e:
+        logger.warning(f"Google Auth failed: {e}")
+    return headers, email
 
 # --- 2. チャート作成 (mplfinance) ---
 def create_chart(df: pd.DataFrame, filename: str, title: str) -> str:
@@ -138,24 +193,6 @@ def create_chart(df: pd.DataFrame, filename: str, title: str) -> str:
 
     return filename
 
-def get_drive_credentials() -> Credentials:
-    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-
-    # 1. Service Account (環境変数) - CI/CD用
-    sa_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
-    if sa_json:
-        try:
-            info = json.loads(sa_json)
-            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        except Exception:
-            pass
-
-    # 2. ADC (gcloud auth application-default login) へのフォールバック
-    # ローカル開発(gcloud CLI) や GCP環境(Cloud Run等) で有効
-    creds, _ = google.auth.default(scopes=SCOPES)
-        
-    return creds
-
 # --- プロンプト取得 ---
 def get_external_prompt(uri: str | None) -> str:
     default_prompt = "これらの株価チャート（日足・週足・月足）を見て、スイングトレード視点で分析してください。"
@@ -165,49 +202,51 @@ def get_external_prompt(uri: str | None) -> str:
         
     target_url = uri
     headers = {}
-    auth_email = None
     
-    # Google Docsの場合、テキストエクスポートURLに変換
-    if "docs.google.com/document/d/" in uri:
-        try:
-            # 認証情報の取得を試みる (非公開ドキュメント対応)
-            try:
-                creds = get_drive_credentials()
-                if hasattr(creds, 'service_account_email'):
-                    auth_email = creds.service_account_email
-                
-                creds.refresh(GoogleAuthRequest())
-                headers['Authorization'] = f'Bearer {creds.token}'
-            except Exception:
-                logger.warning('Failed to Authenticate to Google Docs. Trying public access...')
-
-        except IndexError:
-            logger.error(f"Failed to fetch prompt from Google Docs: {uri}")
-            logger.info("Using default prompt.")
-            return default_prompt
-
     try:
-        # https://docs.google.com/document/d/DOC_ID/edit... -> DOC_ID
-        doc_id = uri.split('/d/')[1].split('/')[0]
-        target_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"            
+        # Google Docsの場合、テキストエクスポートURLに変換
+        if "docs.google.com/document/d/" in uri:
+            headers, _ = get_google_auth_headers()
+            doc_id = uri.split('/d/')[1].split('/')[0]
+            target_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+        else:
+            target_url = uri
+            
         response = requests.get(target_url, headers=headers)
         response.raise_for_status()
         return response.text
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            logger.error(f"⛔ 403 Forbidden: Google Docへのアクセス権限がありません。")
-            if auth_email:
-                logger.info(f"👉 このメールアドレスをGoogle Docの「共有」に追加してください: {auth_email}")
-            else:
-                logger.info("👉 ドキュメントが公開されているか、認証情報が正しいか確認してください。")
-        else:
-            logger.error(f"⚠️ プロンプトの取得に失敗しました (HTTP {e.response.status_code}): {e}")
-        logger.info("Using default prompt.")
-        return default_prompt
     except Exception as e:
         logger.error(f"⚠️ プロンプトの取得に失敗しました: {e}")
         logger.info("Using default prompt.")
         return default_prompt
+
+# --- スプレッドシートから銘柄リスト取得 ---
+def get_stock_list(uri: str | None) -> list[str]:
+    if not uri:
+        return [STOCK_CODE]
+
+    headers = {}
+    try:
+        if "docs.google.com/spreadsheets" in uri:
+            headers, _ = get_google_auth_headers()
+            # https://docs.google.com/spreadsheets/d/DOC_ID/edit... -> DOC_ID
+            doc_id = uri.split('/d/')[1].split('/')[0]
+            url = f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
+        else:
+            url = uri
+        
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        
+        # 文字列として読み込み (0落ち防止)
+        df = pd.read_csv(io.StringIO(res.text), dtype=str)
+        if not df.empty:
+            # 1列目を銘柄コードリストとして取得
+            return df.iloc[:, 0].astype(str).str.strip().tolist()
+    except Exception as e:
+        logger.error(f"Failed to read stock list from sheet: {e}")
+    
+    return [STOCK_CODE]
 
 # --- Gemini API リトライ用関数 ---
 # 503エラー (Overloaded) 対策: 指数バックオフでリトライ (4s, 8s, 16s... 最大60s待機, 5回試行)
@@ -243,14 +282,11 @@ def analyze_chart(image_paths: list[str]) -> str:
         logger.error(f"Gemini API Error: {e}")
         return "分析中にエラーが発生しました。"
 
-# --- メイン実行 ---
-if __name__ == "__main__":
-    # 出力ディレクトリを作成 (CI環境用)
-    os.makedirs('output', exist_ok=True)
-
+def process_stock(code: str):
     # 1. データ取得
-    logger.info("データ取得中...")
-    df = get_stock_data(STOCK_CODE)
+    logger.info(f"データ取得中: {code}...")
+    df = get_stock_data(code)
+    stock_name = get_stock_name(code)
 
     # データ加工 (日足・週足・月足)
     # 日足: 直近6ヶ月 (約130営業日)
@@ -270,9 +306,9 @@ if __name__ == "__main__":
     # 2. チャート作成 (3種類)
     chart_paths = []
     charts_config = [
-        (df_daily, 'output/chart_daily.png', 'Daily Chart'),
-        (df_weekly, 'output/chart_weekly.png', 'Weekly Chart'),
-        (df_monthly, 'output/chart_monthly.png', 'Monthly Chart')
+        (df_daily, 'output/chart_daily.png', f'{stock_name} ({code}) Daily'),
+        (df_weekly, 'output/chart_weekly.png', f'{stock_name} ({code}) Weekly'),
+        # (df_monthly, 'output/chart_monthly.png', 'Monthly Chart')
     ]
 
     logger.info("チャート作成中...")  
@@ -284,7 +320,22 @@ if __name__ == "__main__":
     # 3. 分析
     logger.info("Gemini分析中...")
     result = analyze_chart(chart_paths)
-    
     print("\n" + "="*30)
+    print(f"Analysis Result for {code}")
     print(result)
     print("="*30)
+
+# --- メイン実行 ---
+if __name__ == "__main__":
+    # 出力ディレクトリを作成 (CI環境用)
+    os.makedirs('output', exist_ok=True)
+
+    codes = get_stock_list(STOCK_LIST_SHEET_URL)
+    
+    logger.info(f"Processing {len(codes)} stocks: {codes}")
+
+    for code in codes:
+        try:
+            process_stock(code)
+        except Exception as e:
+            logger.error(f"Error processing {code}: {e}")
