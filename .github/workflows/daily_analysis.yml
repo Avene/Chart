@@ -3,8 +3,8 @@ name: Daily Stock Analysis
 on:
   workflow_dispatch: # Allows manual trigger from GitHub UI
   schedule:
-    # Run at 23:00 UTC (08:00 JST) every weekday (Mon-Fri)
-    - cron: '0 23 * * 0-6'
+    # Run at 22:00 UTC (07:00 JST) every weekday (Mon-Fri)
+    - cron: '0 22 * * 1-5'
 
 jobs:
   analyze:
@@ -28,6 +28,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PROMPT_URI: ${{ secrets.PROMPT_URI }}
+          STOCK_LIST_SHEET_URL: ${{ secrets.STOCK_LIST_SHEET_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GEMINI_MODEL_NAME: ${{ vars.GEMINI_MODEL_NAME }}
 
