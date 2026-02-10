@@ -3,11 +3,15 @@ import logging
 import json
 import io
 import tempfile
+import threading
+import concurrent.futures
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Protocol
 
 import requests
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import mplfinance as mpf
 import yfinance as yf
 import google.auth
@@ -315,7 +319,7 @@ class GeminiService:
 
 # --- Main Workflow ---
 
-def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService):
+def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService, chart_lock: threading.Lock):
     logger.info(f"Processing {code}...")
     
     # 1. データ取得
@@ -330,30 +334,39 @@ def process_stock(code: str, config: AppConfig, provider: StockDataProvider, cha
         # (Data Slice, Filename, Title, MA Periods)
         (
             chart.add_indicators(df.copy(), [5, 25, 75]).tail(130),
-            'output/chart_daily.png',
+            f'output/chart_daily_{code}.png',
             f'{name} ({code}) Daily'
         ),
         (
             chart.add_indicators(df.resample('W-FRI').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna(), [13, 26, 52]).tail(104),
-            'output/chart_weekly.png',
+            f'output/chart_weekly_{code}.png',
             f'{name} ({code}) Weekly'
         ),
         # (df_monthly, 'output/chart_monthly.png', 'Monthly Chart')
     ]
     
     paths = []
-    for d, fname, title in charts_meta:
-        if os.path.exists(fname): os.remove(fname)
-        chart.create_chart_image(d, fname, title)
-        paths.append(fname)
+    try:
+        with chart_lock:
+            for d, fname, title in charts_meta:
+                if os.path.exists(fname): os.remove(fname)
+                chart.create_chart_image(d, fname, title)
+                paths.append(fname)
 
-    # 3. Analysis
-    prompt = google_svc.fetch_text_content(config.PROMPT_URI) or "Analyze these charts."
-    csv_text = df.to_csv()
-    csv_prefix = f"{code}_"
-    result = gemini.analyze(paths, csv_text, csv_prefix, prompt)
-    
-    print(f"\n{'='*30}\nAnalysis Result for {code}\n{result}\n{'='*30}")
+        # 3. Analysis
+        prompt = google_svc.fetch_text_content(config.PROMPT_URI) or "Analyze these charts."
+        csv_text = df.to_csv()
+        csv_prefix = f"{code}_"
+        result = gemini.analyze(paths, csv_text, csv_prefix, prompt)
+        
+        print(f"\n{'='*30}\nAnalysis Result for {code}\n{result}\n{'='*30}")
+    finally:
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 def main():
     os.makedirs('output', exist_ok=True)
@@ -367,19 +380,26 @@ def main():
     
     stock_list = google_svc.fetch_stock_list(config.STOCK_LIST_SHEET_URL)
 
-    # stock_list = [{'code': 'GOOG', 'market': 'US'}]
+    stock_list = [{'code': 'GOOG', 'market': 'US'}, {'code': '4237', 'market': 'JP'}]
     logger.info(f"Target stocks: {len(stock_list)}")
     
-    for item in stock_list:
-        code = item['code']
-        market = item['market']
-        
-        provider = yf_svc if market == 'US' else jq_svc
-        
-        try:
-            process_stock(code, config, provider, chart_svc, google_svc, gemini_svc)
-        except Exception as e:
-            logger.error(f"Error processing {code}: {e}", exc_info=True)
+    chart_lock = threading.Lock()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_code = {}
+        for item in stock_list:
+            code = item['code']
+            market = item['market']
+            provider = yf_svc if market == 'US' else jq_svc
+            
+            future = executor.submit(process_stock, code, config, provider, chart_svc, google_svc, gemini_svc, chart_lock)
+            future_to_code[future] = code
+            
+        for future in concurrent.futures.as_completed(future_to_code):
+            code = future_to_code[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error processing {code}: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
