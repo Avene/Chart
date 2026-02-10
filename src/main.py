@@ -2,12 +2,14 @@ import os
 import logging
 import json
 import io
+import tempfile
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Protocol
 
 import requests
 import pandas as pd
 import mplfinance as mpf
+import yfinance as yf
 import google.auth
 from google.auth.credentials import Credentials
 from google.oauth2 import service_account
@@ -98,9 +100,9 @@ class GoogleService:
             logger.error(f"Failed to fetch content from {uri}: {e}")
             return ""
 
-    def fetch_stock_list(self, uri: str, default_code: str = '79740') -> List[str]:
+    def fetch_stock_list(self, uri: str, default_code: str = '79740') -> List[Dict[str, str]]:
         """Fetches stock list from CSV URL or Google Sheet."""
-        if not uri: return [default_code]
+        if not uri: return [{'code': default_code, 'market': 'JP'}]
         
         headers = {}
         target_url = uri
@@ -115,11 +117,30 @@ class GoogleService:
             res.raise_for_status()
             df = pd.read_csv(io.StringIO(res.text), dtype=str)
             if not df.empty:
-                return df.iloc[:, 0].astype(str).str.strip().tolist()
+                # Normalize columns
+                df.columns = [c.strip() for c in df.columns]
+                stocks = []
+                has_market = 'Market' in df.columns
+                
+                for _, row in df.iterrows():
+                    code = str(row.iloc[0]).strip()
+                    if not code or code.lower() == 'nan': continue
+                    
+                    market = 'JP'
+                    if has_market:
+                        val = str(row['Market']).strip().upper()
+                        if val and val != 'NAN':
+                            market = val
+                    stocks.append({'code': code, 'market': market})
+                return stocks
         except Exception as e:
             logger.error(f"Failed to fetch stock list: {e}")
         
-        return [default_code]
+        return [{'code': default_code, 'market': 'JP'}]
+
+class StockDataProvider(Protocol):
+    def get_daily_prices(self, code: str, days: int = 1825) -> pd.DataFrame: ...
+    def get_company_name(self, code: str) -> str: ...
 
 class JQuantsService:
     """Handles J-Quants API interactions."""
@@ -171,6 +192,35 @@ class JQuantsService:
         except Exception as e:
             logger.warning(f"Failed to get name for {code}: {e}")
         return code
+
+class YFinanceService:
+    """Handles Yahoo Finance API interactions for US stocks."""
+    
+    def get_daily_prices(self, code: str, days: int = 1825) -> pd.DataFrame:
+        start_date = (pd.Timestamp.now() - pd.Timedelta(days=days)).strftime('%Y-%m-%d')
+        try:
+            ticker = yf.Ticker(code)
+            df = ticker.history(start=start_date)
+            if df.empty: return pd.DataFrame()
+            
+            # yfinance returns timezone-aware index, remove it for consistency
+            df.index = df.index.tz_localize(None)
+            df.index.name = 'Date'
+            
+            # Ensure columns exist and return specific columns
+            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if all(col in df.columns for col in required_cols):
+                return df[required_cols]
+            return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"YFinance error for {code}: {e}")
+            return pd.DataFrame()
+
+    def get_company_name(self, code: str) -> str:
+        try:
+            return yf.Ticker(code).info.get('shortName', code)
+        except:
+            return code
 
 class ChartService:
     """Handles Technical Analysis and Chart Plotting."""
@@ -232,15 +282,32 @@ class GeminiService:
         self.model_name = model_name
         self.timeout_ms = 300000
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
+    # @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
     def _generate(self, client, contents):
+        logger.info(f"Generating content with model {self.model_name}")
         return client.models.generate_content(model=self.model_name, contents=contents)
 
-    def analyze(self, image_paths: List[str], prompt: str) -> str:
+    def analyze(self, image_paths: List[str], csv_data: str, csv_prefix: str, prompt: str) -> str:
         client = genai.Client(api_key=self.api_key, http_options={'timeout': self.timeout_ms})
         try:
             imgs = [client.files.upload(file=p, config={'http_options': {'timeout': self.timeout_ms}}) for p in image_paths]
-            response = self._generate(client, [prompt] + imgs)
+            
+            csv_file = None
+            if csv_data:
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix=csv_prefix, suffix='.csv', encoding='utf-8') as tmp:
+                    tmp.write(csv_data)
+                    tmp_path = tmp.name
+                try:
+                    csv_file = client.files.upload(file=tmp_path, config={'mime_type': 'text/csv', 'http_options': {'timeout': self.timeout_ms}})
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+            contents = [prompt] + imgs
+            if csv_file:
+                contents.append(csv_file)
+
+            response = self._generate(client, contents)
             return response.text
         except Exception as e:
             logger.error(f"Gemini Analysis Failed: {e}")
@@ -248,15 +315,15 @@ class GeminiService:
 
 # --- Main Workflow ---
 
-def process_stock(code: str, config: AppConfig, jq: JQuantsService, chart: ChartService, google_svc: GoogleService, gemini: GeminiService):
+def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService):
     logger.info(f"Processing {code}...")
     
     # 1. データ取得
-    df = jq.get_daily_prices(code)
+    df = provider.get_daily_prices(code)
     if df.empty:
         logger.warning(f"No data for {code}")
         return
-    name = jq.get_company_name(code)
+    name = provider.get_company_name(code)
 
     # 2. Charts
     charts_meta = [
@@ -282,7 +349,9 @@ def process_stock(code: str, config: AppConfig, jq: JQuantsService, chart: Chart
 
     # 3. Analysis
     prompt = google_svc.fetch_text_content(config.PROMPT_URI) or "Analyze these charts."
-    result = gemini.analyze(paths, prompt)
+    csv_text = df.to_csv()
+    csv_prefix = f"{code}_"
+    result = gemini.analyze(paths, csv_text, csv_prefix, prompt)
     
     print(f"\n{'='*30}\nAnalysis Result for {code}\n{result}\n{'='*30}")
 
@@ -292,15 +361,23 @@ def main():
     
     google_svc = GoogleService(config.GOOGLE_SERVICE_ACCOUNT_JSON)
     jq_svc = JQuantsService(config.JQUANTS_API_KEY)
+    yf_svc = YFinanceService()
     chart_svc = ChartService()
     gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
     
-    codes = google_svc.fetch_stock_list(config.STOCK_LIST_SHEET_URL)
-    logger.info(f"Target stocks: {codes}")
+    stock_list = google_svc.fetch_stock_list(config.STOCK_LIST_SHEET_URL)
+
+    # stock_list = [{'code': 'GOOG', 'market': 'US'}]
+    logger.info(f"Target stocks: {len(stock_list)}")
     
-    for code in codes:
+    for item in stock_list:
+        code = item['code']
+        market = item['market']
+        
+        provider = yf_svc if market == 'US' else jq_svc
+        
         try:
-            process_stock(code, config, jq_svc, chart_svc, google_svc, gemini_svc)
+            process_stock(code, config, provider, chart_svc, google_svc, gemini_svc)
         except Exception as e:
             logger.error(f"Error processing {code}: {e}", exc_info=True)
 
