@@ -317,16 +317,26 @@ class GeminiService:
             logger.error(f"Gemini Analysis Failed: {e}")
             return "Error during analysis."
 
+    def summarize(self, results: List[str], prompt: str) -> str:
+        client = genai.Client(api_key=self.api_key, http_options={'timeout': self.timeout_ms})
+        try:
+            combined_text = "\n\n---\n\n".join(results)
+            response = self._generate(client, [prompt, combined_text])
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini Summary Failed: {e}")
+            return "Error during summary."
+
 # --- Main Workflow ---
 
-def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService, chart_lock: threading.Lock):
+def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService, chart_lock: threading.Lock) -> Optional[str]:
     logger.info(f"Processing {code}...")
     
     # 1. データ取得
     df = provider.get_daily_prices(code)
     if df.empty:
         logger.warning(f"No data for {code}")
-        return
+        return None
     name = provider.get_company_name(code)
 
     # 2. Charts
@@ -360,6 +370,7 @@ def process_stock(code: str, config: AppConfig, provider: StockDataProvider, cha
         result = gemini.analyze(paths, csv_text, csv_prefix, prompt)
         
         print(f"\n{'='*30}\nAnalysis Result for {code}\n{result}\n{'='*30}")
+        return f"Stock: {code} ({name})\nAnalysis:\n{result}"
     finally:
         for p in paths:
             if os.path.exists(p):
@@ -394,12 +405,21 @@ def main():
             future = executor.submit(process_stock, code, config, provider, chart_svc, google_svc, gemini_svc, chart_lock)
             future_to_code[future] = code
             
+        results = []
         for future in concurrent.futures.as_completed(future_to_code):
             code = future_to_code[future]
             try:
-                future.result()
+                res = future.result()
+                if res:
+                    results.append(res)
             except Exception as e:
                 logger.error(f"Error processing {code}: {e}", exc_info=True)
+
+    if results:
+        logger.info("Generating summary table...")
+        summary_prompt = "Based on the following individual stock analyses, create a summary table. The table should include columns for Stock Code/Name, Overall Trend (Bullish/Bearish/Neutral), Key Technical Signals, and Recommended Action (Buy/Sell/Wait)."
+        summary = gemini_svc.summarize(results, summary_prompt)
+        print(f"\n{'='*30}\nSUMMARY TABLE\n{summary}\n{'='*30}")
 
 if __name__ == "__main__":
     main()
