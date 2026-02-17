@@ -3,7 +3,6 @@ import logging
 import json
 import io
 import tempfile
-import threading
 import concurrent.futures
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Protocol
@@ -20,7 +19,6 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google import genai
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,7 +33,8 @@ class AppConfig:
     GEMINI_MODEL_NAME: str
     STOCK_LIST_SHEET_URL: Optional[str]
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str]
-
+    REPORT_SPREADSHEET_ID: Optional[str]
+    
     @classmethod
     def from_env(cls):
         load_dotenv()
@@ -45,14 +44,18 @@ class AppConfig:
             PROMPT_URI=os.getenv('PROMPT_URI'),
             GEMINI_MODEL_NAME=os.getenv('GEMINI_MODEL_NAME', 'gemini-2.0-flash-exp'),
             STOCK_LIST_SHEET_URL=os.getenv('STOCK_LIST_SHEET_URL'),
-            GOOGLE_SERVICE_ACCOUNT_JSON=os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+            GOOGLE_SERVICE_ACCOUNT_JSON=os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON'),
+            REPORT_SPREADSHEET_ID=os.getenv('REPORT_SPREADSHEET_ID'),
         )
 
 # --- Services ---
 
 class GoogleService:
     """Handles Google Auth, Drive, Docs, and Sheets interactions."""
-    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+    SCOPES = [
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/spreadsheets',
+    ]
 
     def __init__(self, sa_json: Optional[str]):
         self.sa_json = sa_json
@@ -101,7 +104,7 @@ class GoogleService:
             res.raise_for_status()
             return res.text
         except Exception as e:
-            logger.error(f"Failed to fetch content from {uri}: {e}")
+            logger.exception(f"Failed to fetch content from {uri}: {e}")
             return ""
 
     def fetch_stock_list(self, uri: str, default_code: str = '79740') -> List[Dict[str, str]]:
@@ -138,9 +141,113 @@ class GoogleService:
                     stocks.append({'code': code, 'market': market})
                 return stocks
         except Exception as e:
-            logger.error(f"Failed to fetch stock list: {e}")
+            logger.exception(f"Failed to fetch stock list: {e}")
         
         return [{'code': default_code, 'market': 'JP'}]
+
+    def setup_summary_sheet(self, spreadsheet_id: str, new_title: str = "Summary"):
+        """Renames the default first sheet (ID 0) to the given title."""
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
+        headers = self.get_auth_headers()
+        body = {
+            "requests": [{"updateSheetProperties": {"properties": {"sheetId": 0, "title": new_title}, "fields": "title"}}]
+        }
+        try:
+            requests.post(url, headers=headers, json=body)
+        except Exception as e:
+            logger.warning(f"Failed to rename summary sheet: {e}")
+
+    def add_sheet(self, spreadsheet_id: str, title: str):
+        """Adds a new sheet (tab) to the spreadsheet."""
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
+        headers = self.get_auth_headers()
+        # Sheet titles must be <= 31 chars and no special chars
+        safe_title = "".join(c for c in title if c not in r"*?:/\[\]").strip()[:31]
+        body = {"requests": [{"addSheet": {"properties": {"title": safe_title}}}]}
+        try:
+            requests.post(url, headers=headers, json=body)
+        except Exception as e:
+            logger.warning(f"Failed to add sheet '{title}': {e}")
+
+    def get_sheet_values(self, spreadsheet_id: str, range_name: str) -> List[List[str]]:
+        """Reads values from a specific range."""
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{range_name}"
+        headers = self.get_auth_headers()
+        try:
+            res = requests.get(url, headers=headers)
+            res.raise_for_status()
+            return res.json().get('values', [])
+        except Exception as e:
+            logger.exception(f"Failed to get values from '{range_name}': {e}")
+            return []
+
+    def load_watchlist(self, spreadsheet_id: str, sheet_name: str) -> Optional[Dict[str, Any]]:
+        logger.info(f"Reading {sheet_name} from {spreadsheet_id}...")
+        rows = self.get_sheet_values(spreadsheet_id, sheet_name)
+        
+        if not rows:
+            logger.warning(f"No data found in {sheet_name}.")
+            return None
+
+        headers = rows[0]
+        # Helper to find column index or append if missing
+        def get_or_create_col(name):
+            if name in headers:
+                return headers.index(name)
+            headers.append(name)
+            return len(headers) - 1
+
+        # Identify columns
+        try:
+            idx_ticker = headers.index('Ticker')
+            idx_market = headers.index('Market')
+        except ValueError:
+            logger.error("Sheet must contain 'Ticker' and 'Market' columns.")
+            return None
+
+        indices = {
+            'ticker': idx_ticker,
+            'market': idx_market,
+            'name': get_or_create_col('Name'),
+            'price': get_or_create_col('CurrentPrice'),
+            'updated': get_or_create_col('PriceUpdated'),
+        }
+
+        # Separate US and JP stocks for different processing strategies
+        us_to_process = {}
+        jp_to_process = {}
+        for row in rows[1:]: # Skip header
+            try:
+                if len(row) > idx_market:
+                    market = row[idx_market].strip().upper()
+                    ticker = row[idx_ticker]
+                    match market:
+                        case 'US':
+                            us_to_process[ticker] = row
+                        case 'JP':
+                            jp_to_process[ticker] = row
+            except IndexError:
+                continue # Skip malformed rows
+        
+        return {
+            'rows': rows,
+            'headers': headers,
+            'indices': indices,
+            'us_to_process': us_to_process,
+            'jp_to_process': jp_to_process,
+        }
+
+    def update_sheet_values(self, spreadsheet_id: str, sheet_name: str, values: List[List[str]]):
+        """Writes values to the specified sheet starting at A1."""
+        safe_title = "".join(c for c in sheet_name if c not in r"*?:/\[\]").strip()[:31]
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/'{safe_title}'!A1?valueInputOption=RAW"
+        # Use USER_ENTERED to allow formulas like =IMAGE(...)
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/'{safe_title}'!A1?valueInputOption=USER_ENTERED"
+        headers = self.get_auth_headers()
+        try:
+            requests.put(url, headers=headers, json={"values": values})
+        except Exception as e:
+            logger.exception(f"Failed to update values in '{sheet_name}': {e}")
 
 class StockDataProvider(Protocol):
     def get_daily_prices(self, code: str, days: int = 1825) -> pd.DataFrame: ...
@@ -217,7 +324,7 @@ class YFinanceService:
                 return df[required_cols]
             return pd.DataFrame()
         except Exception as e:
-            logger.error(f"YFinance error for {code}: {e}")
+            logger.exception(f"YFinance error for {code}: {e}")
             return pd.DataFrame()
 
     def get_company_name(self, code: str) -> str:
@@ -225,6 +332,60 @@ class YFinanceService:
             return yf.Ticker(code).info.get('shortName', code)
         except:
             return code
+
+    def get_bulk_daily_prices(self, codes: List[str], days: int = 5) -> Dict[str, float]:
+        """Fetches latest prices for multiple tickers in a single request."""
+        if not codes:
+            return {}
+        
+        original_code_map = {code.upper(): code for code in codes}
+        tickers_str = ' '.join(codes)
+        
+        try:
+            df = yf.download(tickers_str, period=f"{days}d", progress=False, threads=True)
+            if df.empty:
+                return {}
+            
+            # If only one ticker, columns are not multi-level
+            if len(codes) == 1:
+                if 'Close' in df.columns and not df.empty:
+                    latest_price = df['Close'].iloc[-1]
+                    return {codes[0]: latest_price} if pd.notna(latest_price) else {}
+                return {}
+
+            latest_prices_series = df['Close'].iloc[-1]
+            
+            result = {}
+            for upper_ticker, price in latest_prices_series.items():
+                original_ticker = original_code_map.get(upper_ticker)
+                if original_ticker and pd.notna(price):
+                    result[original_ticker] = price
+            return result
+        except Exception as e:
+            logger.error(f"YFinance bulk download error: {e}")
+            return {}
+
+    def get_bulk_company_names(self, codes: List[str]) -> Dict[str, str]:
+        """Fetches company names for multiple tickers sequentially to avoid throttling."""
+        if not codes:
+            return {}
+        
+        original_code_map = {code.upper(): code for code in codes}
+        # yf.Tickers is efficient for managing multiple ticker objects
+        tickers = yf.Tickers(' '.join(codes))
+        names = {}
+
+        # Iterate sequentially to avoid sending too many parallel requests for .info
+        for ticker_symbol, ticker_obj in tickers.tickers.items():
+            original_code = original_code_map.get(ticker_symbol, ticker_symbol)
+            try:
+                # Accessing .info triggers a network request for each ticker
+                names[original_code] = ticker_obj.info.get('shortName', original_code)
+            except Exception as e:
+                # If fetching info fails for one, log it and move on
+                logger.warning(f"Could not fetch .info for {original_code}: {e}")
+                names[original_code] = original_code
+        return names
 
 class ChartService:
     """Handles Technical Analysis and Chart Plotting."""
@@ -314,7 +475,7 @@ class GeminiService:
             response = self._generate(client, contents)
             return response.text
         except Exception as e:
-            logger.error(f"Gemini Analysis Failed: {e}")
+            logger.exception(f"Gemini Analysis Failed: {e}")
             return "Error during analysis."
 
     def summarize(self, results: List[str], prompt: str) -> str:
@@ -324,102 +485,89 @@ class GeminiService:
             response = self._generate(client, [prompt, combined_text])
             return response.text
         except Exception as e:
-            logger.error(f"Gemini Summary Failed: {e}")
+            logger.exception(f"Gemini Summary Failed: {e}")
             return "Error during summary."
 
 # --- Main Workflow ---
 
-def process_stock(code: str, config: AppConfig, provider: StockDataProvider, chart: ChartService, google_svc: GoogleService, gemini: GeminiService, chart_lock: threading.Lock) -> Optional[str]:
-    logger.info(f"Processing {code}...")
-    
-    # 1. データ取得
-    df = provider.get_daily_prices(code)
-    if df.empty:
-        logger.warning(f"No data for {code}")
-        return None
-    name = provider.get_company_name(code)
-
-    # 2. Charts
-    charts_meta = [
-        # (Data Slice, Filename, Title, MA Periods)
-        (
-            chart.add_indicators(df.copy(), [5, 25, 75]).tail(130),
-            f'output/chart_daily_{code}.png',
-            f'{name} ({code}) Daily'
-        ),
-        (
-            chart.add_indicators(df.resample('W-FRI').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna(), [13, 26, 52]).tail(104),
-            f'output/chart_weekly_{code}.png',
-            f'{name} ({code}) Weekly'
-        ),
-        # (df_monthly, 'output/chart_monthly.png', 'Monthly Chart')
-    ]
-    
-    paths = []
-    try:
-        with chart_lock:
-            for d, fname, title in charts_meta:
-                if os.path.exists(fname): os.remove(fname)
-                chart.create_chart_image(d, fname, title)
-                paths.append(fname)
-
-        # 3. Analysis
-        prompt = google_svc.fetch_text_content(config.PROMPT_URI) or "Analyze these charts."
-        csv_text = df.to_csv()
-        csv_prefix = f"{code}_"
-        result = gemini.analyze(paths, csv_text, csv_prefix, prompt)
-        
-        print(f"\n{'='*30}\nAnalysis Result for {code}\n{result}\n{'='*30}")
-        return f"Stock: {code} ({name})\nAnalysis:\n{result}"
-    finally:
-        for p in paths:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
 def main():
     os.makedirs('output', exist_ok=True)
+    # Load Config
     config = AppConfig.from_env()
     
     google_svc = GoogleService(config.GOOGLE_SERVICE_ACCOUNT_JSON)
     jq_svc = JQuantsService(config.JQUANTS_API_KEY)
     yf_svc = YFinanceService()
-    chart_svc = ChartService()
-    gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
-    
-    stock_list = google_svc.fetch_stock_list(config.STOCK_LIST_SHEET_URL)
 
-    stock_list = [{'code': 'GOOG', 'market': 'US'}, {'code': '4237', 'market': 'JP'}]
-    logger.info(f"Target stocks: {len(stock_list)}")
-    
-    chart_lock = threading.Lock()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        future_to_code = {}
-        for item in stock_list:
-            code = item['code']
-            market = item['market']
-            provider = yf_svc if market == 'US' else jq_svc
-            
-            future = executor.submit(process_stock, code, config, provider, chart_svc, google_svc, gemini_svc, chart_lock)
-            future_to_code[future] = code
-            
-        results = []
-        for future in concurrent.futures.as_completed(future_to_code):
-            code = future_to_code[future]
-            try:
-                res = future.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                logger.error(f"Error processing {code}: {e}", exc_info=True)
+    sid = config.REPORT_SPREADSHEET_ID
+    if not sid:
+        logger.error("REPORT_SPREADSHEET_ID is not set.")
+        return
+    sheet_name = "Sheet1"
+    # 1. Read the spreadsheet (Sheet1)
+    data = google_svc.load_watchlist(sid, sheet_name)
+    if not data:
+        return
 
-    if results:
-        logger.info("Generating summary table...")
-        summary_prompt = "Based on the following individual stock analyses, create a summary table. The table should include columns for Stock Code/Name, Overall Trend (Bullish/Bearish/Neutral), Key Technical Signals, and Recommended Action (Buy/Sell/Wait)."
-        summary = gemini_svc.summarize(results, summary_prompt)
-        print(f"\n{'='*30}\nSUMMARY TABLE\n{summary}\n{'='*30}")
+    headers = data['headers']
+    indices = data['indices']
+
+    idx_ticker = indices['ticker']
+    idx_name = indices['name']
+    idx_price = indices['price']
+    idx_updated = indices['updated']
+
+    # 2. Process rows
+    now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # --- Process US Stocks in Bulk ---
+    if (us_to_process := data['us_to_process']):
+        logger.info(f"Processing {len(us_to_process)} US stocks in bulk...")
+        us_tickers_all = list(us_to_process.keys())
+        us_tickers_needing_name = [
+            t for t, row in us_to_process.items() if len(row) <= idx_name or not row[idx_name]
+        ]
+        
+        names_map = yf_svc.get_bulk_company_names(us_tickers_needing_name)
+        prices_map = yf_svc.get_bulk_daily_prices(us_tickers_all, days=5)
+        
+        for ticker, row in us_to_process.items():
+            while len(row) < len(headers): row.append("") # Pad row
+            
+            # Update name only if it was fetched (i.e., it was empty before)
+            if ticker in names_map:
+                row[idx_name] = names_map[ticker]
+            if ticker in prices_map:
+                row[idx_price] = str(prices_map[ticker])
+                row[idx_updated] = now_str
+
+    # --- Process JP Stocks concurrently ---
+    def fetch_jp_data(row_data):
+        while len(row_data) < len(headers): row_data.append("")
+        ticker = row_data[idx_ticker]
+        if not ticker: return
+        
+        try:
+            # Only fetch and update name if the column is empty
+            if len(row_data) <= idx_name or not row_data[idx_name]:
+                row_data[idx_name] = jq_svc.get_company_name(ticker)
+            df = jq_svc.get_daily_prices(ticker, days=5)
+            if not df.empty:
+                row_data[idx_price] = str(df.iloc[-1]['Close'])
+                row_data[idx_updated] = now_str
+        except Exception as e:
+            logger.error(f"Error fetching JP ticker {ticker}: {e}")
+
+    if (jp_to_process := data['jp_to_process']):
+        logger.info(f"Processing {len(jp_to_process)} JP stocks concurrently...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_jp_data, row) for row in jp_to_process.values()]
+            concurrent.futures.wait(futures)
+
+    # 3. Assemble final table and write back
+    logger.info("Writing updated data back to sheet...")
+    google_svc.update_sheet_values(sid, sheet_name, data['rows'])
+    logger.info("Done.")
 
 if __name__ == "__main__":
     main()
