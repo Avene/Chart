@@ -217,17 +217,18 @@ class GoogleService:
         us_to_process = {}
         jp_to_process = {}
         for row in rows[1:]: # Skip header
-            try:
-                if len(row) > idx_market:
-                    market = row[idx_market].strip().upper()
-                    ticker = row[idx_ticker]
-                    match market:
-                        case 'US':
-                            us_to_process[ticker] = row
-                        case 'JP':
-                            jp_to_process[ticker] = row
-            except IndexError:
-                continue # Skip malformed rows
+            if len(row) <= idx_market:
+                logger.warning(f"Skipping row with missing Market column: {row}")
+                continue # Skip if Market column is missing in this row
+
+            match row[idx_market].strip().upper():
+                case 'US':
+                    us_to_process[row[idx_ticker]] = row
+                case 'JP':
+                    jp_to_process[row[idx_ticker]] = row
+                case _:
+                    logger.warning(f"Unknown market '{row[idx_market]}' for ticker '{row[idx_ticker]}', skipping.   Row: {row}")
+                    continue 
         
         return {
             'rows': rows,
