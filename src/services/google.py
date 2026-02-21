@@ -67,7 +67,7 @@ class WatchlistData(BaseModel):
     def to_sheet_values(self) -> List[List[str]]:
         values = [self.headers]
         for row in self.stocks:
-            d = row.model_dump(by_alias=True)
+            d = row.model_dump(by_alias=True, mode='json')
             values.append([str(d.get(h, "") or "") for h in self.headers])
         return values
 

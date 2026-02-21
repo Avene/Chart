@@ -96,6 +96,8 @@ class GeminiService:
                 contents.append(csv_file)
 
             response = self._generate(client, contents)
+            if response.usage_metadata:
+                logger.info(f"Gemini Usage: {response.usage_metadata}")
             return response.text
         except Exception as e:
             logger.exception(f"Gemini Analysis Failed: {e}")
@@ -106,6 +108,8 @@ class GeminiService:
         try:
             combined_text = "\n\n---\n\n".join(results)
             response = self._generate(client, [prompt, combined_text])
+            if response.usage_metadata:
+                logger.info(f"Gemini Usage: {response.usage_metadata}")
             return response.text
         except Exception as e:
             logger.exception(f"Gemini Summary Failed: {e}")

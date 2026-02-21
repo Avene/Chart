@@ -6,6 +6,7 @@ import pandas as pd
 from config import AppConfig
 from services.google import GoogleService
 from services.market import JQuantsService, YFinanceService
+from services.analysis import ChartService, GeminiService
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -81,6 +82,44 @@ def main():
     logger.info("Writing updated data back to sheet...")
     google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
+
+    # --- Analysis for Short Term Hold ---
+    short_term_stocks = data.stocks.short_term_hold()
+    if not short_term_stocks:
+        return
+
+    logger.info(f"Starting analysis for {len(short_term_stocks)} short-term hold stocks...")
+    gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
+    
+    prompt = "Analyze this chart for a short-term trade setup."
+    if config.PROMPT_URI:
+        p = google_svc.fetch_text_content(config.PROMPT_URI)
+        if p: prompt = p
+
+    for row in short_term_stocks:
+        ticker = row.ticker
+        market = row.market.strip().upper()
+        
+        try:
+            df = pd.DataFrame()
+            if market == 'US':
+                df = yf_svc.get_daily_prices(ticker, days=180)
+            elif market == 'JP':
+                df = jq_svc.get_daily_prices(ticker, days=180)
+            
+            if df.empty:
+                logger.warning(f"No data for {ticker}")
+                continue
+
+            df = ChartService.add_indicators(df, periods=[5, 25, 75])
+            chart_path = os.path.join('output', f"{ticker}.png")
+            ChartService.create_chart_image(df, chart_path, f"{ticker} - {row.name}")
+            
+            analysis = gemini_svc.analyze([chart_path], df.tail(10).to_csv(), ticker, prompt)
+            print(f"\n--- Analysis for {ticker} ---\n{analysis}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze {ticker}: {e}")
 
 if __name__ == "__main__":
     main()
