@@ -10,7 +10,7 @@ import google.auth
 from google.oauth2 import service_account
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from pydantic import BaseModel, Field, ConfigDict, ValidationError
+from pydantic import BaseModel, Field, ConfigDict, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -38,31 +38,38 @@ class WatchlistRow(BaseModel):
     plan_updated: str = Field(alias='PlanUpdated', default="")
     memo: str = Field(alias='Memo', default="")
 
+class WatchlistRows(list):
+    def us(self) -> "WatchlistRows":
+        return WatchlistRows([r for r in self if r.market.strip().upper() == 'US'])
+
+    def jp(self) -> "WatchlistRows":
+        return WatchlistRows([r for r in self if r.market.strip().upper() == 'JP'])
+
+    def watching(self) -> "WatchlistRows":
+        return WatchlistRows([r for r in self if r.status == StatusEnum.WATCHING])
+
+    def long_term_hold(self) -> "WatchlistRows":
+        return WatchlistRows([r for r in self if r.status == StatusEnum.LONG_TERM_HOLD])
+
+    def short_term_hold(self) -> "WatchlistRows":
+        return WatchlistRows([r for r in self if r.status == StatusEnum.SHORT_TERM_HOLD])
+
 class WatchlistData(BaseModel):
-    rows: List[WatchlistRow]
+    stocks: List[WatchlistRow]
     headers: List[str]
     indices: Dict[str, int]
 
+    @field_validator('stocks', mode='after')
+    @classmethod
+    def _validate_rows(cls, v: List[WatchlistRow]) -> WatchlistRows:
+        return WatchlistRows(v)
+
     def to_sheet_values(self) -> List[List[str]]:
         values = [self.headers]
-        for row in self.rows:
+        for row in self.stocks:
             d = row.model_dump(by_alias=True)
             values.append([str(d.get(h, "") or "") for h in self.headers])
         return values
-
-    def get_us_stocks(self) -> Dict[str, WatchlistRow]:
-        return {
-            row.ticker: row
-            for row in self.rows
-            if row.market.strip().upper() == 'US' and row.ticker
-        }
-
-    def get_jp_stocks(self) -> Dict[str, WatchlistRow]:
-        return {
-            row.ticker: row
-            for row in self.rows
-            if row.market.strip().upper() == 'JP' and row.ticker
-        }
 
 class GoogleService:
     """Handles Google Auth, Drive, Docs, and Sheets interactions."""
@@ -240,7 +247,7 @@ class GoogleService:
             return None
 
         return WatchlistData(
-            rows=data_rows,
+            stocks=data_rows,
             headers=headers,
             indices=indices,
         )

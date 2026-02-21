@@ -36,17 +36,18 @@ def main():
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # --- Process US Stocks in Bulk ---
-    if (us_to_process := data.get_us_stocks()):
-        logger.info(f"Processing {len(us_to_process)} US stocks in bulk...")
-        us_tickers_all = list(us_to_process.keys())
+    if (us_stocks := data.stocks.us()):
+        logger.info(f"Processing {len(us_stocks)} US stocks in bulk...")
+        us_tickers_all = [r.ticker for r in us_stocks]
         us_tickers_needing_name = [
-            t for t, row in us_to_process.items() if not row.name
+            r.ticker for r in us_stocks if not r.name
         ]
         
         names_map = yf_svc.get_bulk_company_names(us_tickers_needing_name)
         prices_map = yf_svc.get_bulk_daily_prices(us_tickers_all, days=5)
         
-        for ticker, row in us_to_process.items():
+        for row in us_stocks:
+            ticker = row.ticker
             # Update name only if it was fetched (i.e., it was empty before)
             if ticker in names_map:
                 row.name = names_map[ticker]
@@ -70,10 +71,10 @@ def main():
         except Exception as e:
             logger.error(f"Error fetching JP ticker {ticker}: {e}")
 
-    if (jp_to_process := data.get_jp_stocks()):
-        logger.info(f"Processing {len(jp_to_process)} JP stocks concurrently...")
+    if (jp_stocks := data.stocks.jp()):
+        logger.info(f"Processing {len(jp_stocks)} JP stocks concurrently...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(fetch_jp_data, row) for row in jp_to_process.values()]
+            futures = [executor.submit(fetch_jp_data, row) for row in jp_stocks]
             concurrent.futures.wait(futures)
 
     # 3. Assemble final table and write back
