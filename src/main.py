@@ -29,58 +29,48 @@ def main():
     # 1. Read the spreadsheet (Sheet1)
     data = google_svc.load_watchlist(sid, sheet_name)
     if not data:
+        logger.error("Watchlist data is empty")
         return
-
-    headers = data['headers']
-    indices = data['indices']
-
-    idx_ticker = indices['ticker']
-    idx_name = indices['name']
-    idx_price = indices['price']
-    idx_updated = indices['updated']
 
     # 2. Process rows
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # --- Process US Stocks in Bulk ---
-    if (us_to_process := data['us_to_process']):
+    if (us_to_process := data.get_us_stocks()):
         logger.info(f"Processing {len(us_to_process)} US stocks in bulk...")
         us_tickers_all = list(us_to_process.keys())
         us_tickers_needing_name = [
-            t for t, row in us_to_process.items() if len(row) <= idx_name or not row[idx_name]
+            t for t, row in us_to_process.items() if not row.name
         ]
         
         names_map = yf_svc.get_bulk_company_names(us_tickers_needing_name)
         prices_map = yf_svc.get_bulk_daily_prices(us_tickers_all, days=5)
         
         for ticker, row in us_to_process.items():
-            while len(row) < len(headers): row.append("") # Pad row
-            
             # Update name only if it was fetched (i.e., it was empty before)
             if ticker in names_map:
-                row[idx_name] = names_map[ticker]
+                row.name = names_map[ticker]
             if ticker in prices_map:
-                row[idx_price] = str(prices_map[ticker])
-                row[idx_updated] = now_str
+                row.current_price = str(prices_map[ticker])
+                row.price_updated = now_str
 
     # --- Process JP Stocks concurrently ---
-    def fetch_jp_data(row_data):
-        while len(row_data) < len(headers): row_data.append("")
-        ticker = row_data[idx_ticker]
+    def fetch_jp_data(row):
+        ticker = row.ticker
         if not ticker: return
         
         try:
             # Only fetch and update name if the column is empty
-            if len(row_data) <= idx_name or not row_data[idx_name]:
-                row_data[idx_name] = jq_svc.get_company_name(ticker)
+            if not row.name:
+                row.name = jq_svc.get_company_name(ticker)
             df = jq_svc.get_daily_prices(ticker, days=5)
             if not df.empty:
-                row_data[idx_price] = str(df.iloc[-1]['Close'])
-                row_data[idx_updated] = now_str
+                row.current_price = str(df.iloc[-1]['Close'])
+                row.price_updated = now_str
         except Exception as e:
             logger.error(f"Error fetching JP ticker {ticker}: {e}")
 
-    if (jp_to_process := data['jp_to_process']):
+    if (jp_to_process := data.get_jp_stocks()):
         logger.info(f"Processing {len(jp_to_process)} JP stocks concurrently...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(fetch_jp_data, row) for row in jp_to_process.values()]
@@ -88,7 +78,7 @@ def main():
 
     # 3. Assemble final table and write back
     logger.info("Writing updated data back to sheet...")
-    google_svc.update_sheet_values(sid, sheet_name, data['rows'])
+    google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
 
 if __name__ == "__main__":

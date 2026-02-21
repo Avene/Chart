@@ -103,20 +103,41 @@ class YFinanceService:
             if df.empty:
                 return {}
             
-            # If only one ticker, columns are not multi-level
-            if len(codes) == 1:
-                if 'Close' in df.columns and not df.empty:
-                    latest_price = df['Close'].iloc[-1]
-                    return {codes[0]: latest_price} if pd.notna(latest_price) else {}
+            # Handle 'Close' column extraction safely for both MultiIndex and Flat DataFrames
+            close_data = None
+            if isinstance(df.columns, pd.MultiIndex):
+                if 'Close' in df.columns.get_level_values(0):
+                    close_data = df['Close']
+            elif 'Close' in df.columns:
+                close_data = df['Close']
+            
+            if close_data is None or close_data.empty:
                 return {}
 
-            latest_prices_series = df['Close'].iloc[-1]
+            # Get latest prices (last row)
+            latest = close_data.iloc[-1]
             
             result = {}
-            for upper_ticker, price in latest_prices_series.items():
-                original_ticker = original_code_map.get(upper_ticker)
-                if original_ticker and pd.notna(price):
-                    result[original_ticker] = price
+            
+            # Case 1: Multiple tickers (or single ticker returned as MultiIndex) -> Series
+            if isinstance(latest, pd.Series):
+                for ticker, price in latest.items():
+                    # Guard against duplicate columns resulting in Series values
+                    if isinstance(price, pd.Series):
+                        price = price.iloc[0]
+                        
+                    if pd.notna(price):
+                        ticker_upper = str(ticker).upper()
+                        original_code = original_code_map.get(ticker_upper)
+                        if original_code:
+                            result[original_code] = float(price)
+                            
+            # Case 2: Single ticker flat DataFrame -> Scalar
+            elif pd.notna(latest):
+                # If we only requested one code, map it
+                if len(codes) == 1:
+                    result[codes[0]] = float(latest)
+            
             return result
         except Exception as e:
             logger.error(f"YFinance bulk download error: {e}")

@@ -2,6 +2,7 @@ import json
 import logging
 import io
 from typing import List, Optional, Dict, Any
+from enum import Enum
 
 import requests
 import pandas as pd
@@ -9,8 +10,59 @@ import google.auth
 from google.oauth2 import service_account
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
 logger = logging.getLogger(__name__)
+
+class StatusEnum(str, Enum):
+    WATCHING = 'Watching'
+    LONG_TERM_HOLD = 'LongTermHold'
+    SHORT_TERM_HOLD = 'ShortTermHold'
+
+class WatchlistRow(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ticker: str = Field(alias='Ticker', default="")
+    market: str = Field(alias='Market', default="")
+    name: str = Field(alias='Name', default="")
+    status: StatusEnum = Field(alias='Status')
+    route: str = Field(alias='Route', default="")
+    current_price: str = Field(alias='CurrentPrice', default="")
+    price_updated: str = Field(alias='PriceUpdated', default="")
+    action_plan: str = Field(alias='ActionPlan', default="")
+    score: str = Field(alias='Score', default="")
+    loss_cut_target: str = Field(alias='LossCutTarget', default="")
+    entry_target: str = Field(alias='EntryTarget', default="")
+    profit_take_target: str = Field(alias='ProfitTakeTarget', default="")
+    comment: str = Field(alias='Comment', default="")
+    plan_updated: str = Field(alias='PlanUpdated', default="")
+    memo: str = Field(alias='Memo', default="")
+
+class WatchlistData(BaseModel):
+    rows: List[WatchlistRow]
+    headers: List[str]
+    indices: Dict[str, int]
+
+    def to_sheet_values(self) -> List[List[str]]:
+        values = [self.headers]
+        for row in self.rows:
+            d = row.model_dump(by_alias=True)
+            values.append([str(d.get(h, "") or "") for h in self.headers])
+        return values
+
+    def get_us_stocks(self) -> Dict[str, WatchlistRow]:
+        return {
+            row.ticker: row
+            for row in self.rows
+            if row.market.strip().upper() == 'US' and row.ticker
+        }
+
+    def get_jp_stocks(self) -> Dict[str, WatchlistRow]:
+        return {
+            row.ticker: row
+            for row in self.rows
+            if row.market.strip().upper() == 'JP' and row.ticker
+        }
 
 class GoogleService:
     """Handles Google Auth, Drive, Docs, and Sheets interactions."""
@@ -143,7 +195,7 @@ class GoogleService:
             logger.exception(f"Failed to get values from '{range_name}': {e}")
             return []
 
-    def load_watchlist(self, spreadsheet_id: str, sheet_name: str) -> Optional[Dict[str, Any]]:
+    def load_watchlist(self, spreadsheet_id: str, sheet_name: str) -> Optional[WatchlistData]:
         logger.info(f"Reading {sheet_name} from {spreadsheet_id}...")
         rows = self.get_sheet_values(spreadsheet_id, sheet_name)
         
@@ -152,53 +204,46 @@ class GoogleService:
             return None
 
         headers = rows[0]
-        # Helper to find column index or append if missing
-        def get_or_create_col(name):
-            if name in headers:
-                return headers.index(name)
-            headers.append(name)
-            return len(headers) - 1
+        data_rows = []        
+        for r in rows[1:]:
+            # Pad row with empty strings to match headers length for zipping
+            r_padded = r + [""] * (len(headers) - len(r))
+            row_dict = dict(zip(headers, r_padded))
+            try:
+                data_rows.append(WatchlistRow(**row_dict))
+            except ValidationError as e:
+                logger.warning(f"Skipping row due to validation error: {row_dict.get('Ticker', 'Unknown')} - {e}")
+                continue
 
         # Identify columns
         try:
-            idx_ticker = headers.index('Ticker')
-            idx_market = headers.index('Market')
+
+            indices = {
+                'ticker': headers.index('Ticker'),
+                'market': headers.index('Market'),
+                'name': headers.index('Name'),
+                'status': headers.index('Status'),
+                'route': headers.index('Route'),
+                'price': headers.index('CurrentPrice')                                   ,
+                'updated': headers.index('PriceUpdated'),
+                'action_plan': headers.index('ActionPlan'),
+                'score': headers.index('Score'),
+                'loss_cut': headers.index('LossCutTarget'),
+                'entry': headers.index('EntryTarget'),
+                'profit_take': headers.index('ProfitTakeTarget'),
+                'comment': headers.index('Comment'),
+                'plan_updated': headers.index('PlanUpdated'),
+                'memo': headers.index('Memo'),
+            }            
         except ValueError:
             logger.error("Sheet must contain 'Ticker' and 'Market' columns.")
             return None
 
-        indices = {
-            'ticker': idx_ticker,
-            'market': idx_market,
-            'name': get_or_create_col('Name'),
-            'price': get_or_create_col('CurrentPrice'),
-            'updated': get_or_create_col('PriceUpdated'),
-        }
-
-        # Separate US and JP stocks for different processing strategies
-        us_to_process = {}
-        jp_to_process = {}
-        for row in rows[1:]: # Skip header
-            if len(row) <= idx_market:
-                logger.warning(f"Skipping row with missing Market column: {row}")
-                continue # Skip if Market column is missing in this row
-
-            match row[idx_market].strip().upper():
-                case 'US':
-                    us_to_process[row[idx_ticker]] = row
-                case 'JP':
-                    jp_to_process[row[idx_ticker]] = row
-                case _:
-                    logger.warning(f"Unknown market '{row[idx_market]}' for ticker '{row[idx_ticker]}', skipping.   Row: {row}")
-                    continue 
-        
-        return {
-            'rows': rows,
-            'headers': headers,
-            'indices': indices,
-            'us_to_process': us_to_process,
-            'jp_to_process': jp_to_process,
-        }
+        return WatchlistData(
+            rows=data_rows,
+            headers=headers,
+            indices=indices,
+        )
 
     def update_sheet_values(self, spreadsheet_id: str, sheet_name: str, values: List[List[str]]):
         """Writes values to the specified sheet starting at A1."""
