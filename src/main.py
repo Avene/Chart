@@ -53,9 +53,7 @@ def main():
     cache_name = gemini_svc.setup_cache(prompt, checklist_str)
 
     for row in short_term_stocks:
-        ticker = row.ticker
-        market = row.market.strip().upper()
-        
+        ticker = row.ticker        
         try:
             df = pd.DataFrame()
             match row.market:
@@ -69,12 +67,27 @@ def main():
                 continue
 
             chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
-            analysis = gemini_svc.analyze(chart_paths, df_daily.tail(10).to_csv(), ticker, prompt, checklist_str, cached_content=cache_name)
-            print(f"\n--- Analysis for {ticker} ---\n{analysis}\n")
+            analysis = gemini_svc.analyze(chart_paths, df_daily.tail(90).to_csv(), ticker, prompt, checklist_str, cached_content=cache_name)
+            
+            row.score = analysis.score
+            row.action_plan = analysis.action_plan
+            row.loss_cut_target = analysis.loss_cut_target
+            row.entry_target = analysis.entry_target
+            row.profit_take_target = analysis.profit_take_target
+            row.comment = analysis.comment
+            row.memo = analysis.memo
+            row.plan_updated = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            print(f"\n--- Analysis for {ticker} ---\n{analysis.comment}\n")
             
         except Exception as e:
             logger.error(f"Failed to analyze {ticker}: {e}")
+            return
             
+    logger.info("Writing analysis results back to sheet...")
+    google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
+    logger.info("Analysis complete.")
+
 def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 

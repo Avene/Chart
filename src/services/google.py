@@ -11,6 +11,7 @@ from google.oauth2 import service_account
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from pydantic import BaseModel, Field, ConfigDict, ValidationError, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 logger = logging.getLogger(__name__)
 
@@ -23,24 +24,58 @@ class MarketEnum(str, Enum):
     US = 'US'
     JP = 'JP'
 
+class ActionPlanEnum(str, Enum):
+    StrongBuy = 'StrongBuy'
+    Buy = 'Buy'
+    Wait = 'Wait'
+    Sell = 'Sell'
+    StrongSell = 'StrongSell'
+
+
 class WatchlistRow(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra='ignore')
 
     ticker: str = Field(alias='Ticker', default="")
-    market: MarketEnum = Field(alias='Market')
+    market: MarketEnum | None = Field(alias='Market', default = None)
     name: str = Field(alias='Name', default="")
-    status: StatusEnum = Field(alias='Status')
+    status: StatusEnum | None = Field(alias='Status', default=None)
     route: str = Field(alias='Route', default="")
     current_price: str = Field(alias='CurrentPrice', default="")
     price_updated: str = Field(alias='PriceUpdated', default="")
-    action_plan: str = Field(alias='ActionPlan', default="")
-    score: str = Field(alias='Score', default="")
-    loss_cut_target: str = Field(alias='LossCutTarget', default="")
-    entry_target: str = Field(alias='EntryTarget', default="")
-    profit_take_target: str = Field(alias='ProfitTakeTarget', default="")
+    action_plan: ActionPlanEnum | None = Field(alias='ActionPlan', default=None)
+    score: str = Field(alias='Score', default='', json_schema_extra={'example': ['10/10', '1/10']})
+    loss_cut_target: str = Field(alias='LossCutTarget', default="", json_schema_extra={'example': ['5000円もしくは短期移動平均下抜け']})
+    entry_target: str = Field(alias='EntryTarget', default="", json_schema_extra={'example': ['短期移動平均上抜けもしくは下ヒゲ陽線']})
+    profit_take_target: str = Field(alias='ProfitTakeTarget', default="", json_schema_extra={'example': ['5000円もしくは3σ上抜けで半分利確']})
     comment: str = Field(alias='Comment', default="")
     plan_updated: str = Field(alias='PlanUpdated', default="")
     memo: str = Field(alias='Memo', default="")
+
+class WatchlistRowWritable(WatchlistRow):
+    model_config = ConfigDict(populate_by_name=True, extra='ignore')
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Any:
+        json_schema = handler(core_schema)
+        json_schema = handler.resolve_ref_schema(json_schema)
+        
+        exclude = {
+            'ticker', 'Ticker', 'market', 'Market', 'name', 'Name', 
+            'status', 'Status', 'route', 'Route', 
+            'current_price', 'CurrentPrice', 'price_updated', 'PriceUpdated', 'memo', 'Memo'
+        }
+        
+        properties = json_schema.get('properties', {})
+        for field in list(properties.keys()):
+            if field in exclude:
+                del properties[field]
+        
+        if 'required' in json_schema:
+            json_schema['required'] = [f for f in json_schema['required'] if f not in exclude]
+            
+        return json_schema
+
+
 
 T = TypeVar("T", bound="WatchlistRow")
 

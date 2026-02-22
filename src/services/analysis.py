@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
 from google import genai
+from services.google import WatchlistRowWritable
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +142,7 @@ class GeminiService:
             logger.warning(f"Cache setup failed: {e}")
             return None
 
-    def analyze(self, image_paths: List[str], csv_data: str, csv_prefix: str, prompt: str, checklist_content: str | None, cached_content: str | None = None) -> str:
+    def analyze(self, image_paths: List[str], csv_data: str, csv_prefix: str, prompt: str, checklist_content: str | None, cached_content: str | None = None) -> WatchlistRowWritable:
         try:
             imgs = [self.client.files.upload(file=p, config={'http_options': {'timeout': self.timeout_ms}}) for p in image_paths]
             
@@ -168,15 +169,21 @@ class GeminiService:
             if checklist_content and not cached_content:
                 contents.append(checklist_content)
 
-            config = {'cached_content': cached_content} if cached_content else None
+            config = {
+                'response_mime_type': 'application/json',
+                'response_schema': WatchlistRowWritable
+            }
+            if cached_content:
+                config['cached_content'] = cached_content
+
             response = self._generate(contents, config=config)
             
             if response.usage_metadata:
                 logger.info(f"Gemini Usage: {response.usage_metadata}")
-            return response.text
+            return WatchlistRowWritable.model_validate_json(response.text)
         except Exception as e:
             logger.exception(f"Gemini Analysis Failed: {e}")
-            return "Error during analysis."
+            return WatchlistRowWritable(Comment="Error during analysis.")
 
     def summarize(self, results: List[str], prompt: str) -> str:
         try:
