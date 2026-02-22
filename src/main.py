@@ -34,6 +34,48 @@ def main():
         return
 
     # 2. Process rows
+    data = update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data)
+
+    # --- Analysis for Short Term Hold ---
+    short_term_stocks = data.stocks.short_term_hold()
+    if not short_term_stocks:
+        return
+
+    logger.info(f"Starting analysis for {len(short_term_stocks)} short-term hold stocks...")
+    gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
+    
+    prompt = "Analyze this chart for a short-term trade setup."
+    if config.PROMPT_URI:
+        p = google_svc.fetch_text_content(config.PROMPT_URI)
+        if p: prompt = p
+
+    checklist_str = google_svc.fetch_text_content(config.CHECKLIST_URI)
+    cache_name = gemini_svc.setup_cache(prompt, checklist_str)
+
+    for row in short_term_stocks:
+        ticker = row.ticker
+        market = row.market.strip().upper()
+        
+        try:
+            df = pd.DataFrame()
+            match row.market:
+                case 'US':
+                    df = yf_svc.get_daily_prices(ticker, days=1825)
+                case 'JP':
+                    df = jq_svc.get_daily_prices(ticker, days=1825)
+                        
+            if df.empty:
+                logger.warning(f"No data for {ticker}")
+                continue
+
+            chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
+            analysis = gemini_svc.analyze(chart_paths, df_daily.tail(10).to_csv(), ticker, prompt, checklist_str, cached_content=cache_name)
+            print(f"\n--- Analysis for {ticker} ---\n{analysis}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze {ticker}: {e}")
+            
+def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # --- Process US Stocks in Bulk ---
@@ -82,44 +124,7 @@ def main():
     logger.info("Writing updated data back to sheet...")
     google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
-
-    # --- Analysis for Short Term Hold ---
-    short_term_stocks = data.stocks.short_term_hold()
-    if not short_term_stocks:
-        return
-
-    logger.info(f"Starting analysis for {len(short_term_stocks)} short-term hold stocks...")
-    gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
-    
-    prompt = "Analyze this chart for a short-term trade setup."
-    if config.PROMPT_URI:
-        p = google_svc.fetch_text_content(config.PROMPT_URI)
-        if p: prompt = p
-
-    for row in short_term_stocks:
-        ticker = row.ticker
-        market = row.market.strip().upper()
-        
-        try:
-            df = pd.DataFrame()
-            if market == 'US':
-                df = yf_svc.get_daily_prices(ticker, days=180)
-            elif market == 'JP':
-                df = jq_svc.get_daily_prices(ticker, days=180)
-            
-            if df.empty:
-                logger.warning(f"No data for {ticker}")
-                continue
-
-            df = ChartService.add_indicators(df, periods=[5, 25, 75])
-            chart_path = os.path.join('output', f"{ticker}.png")
-            ChartService.create_chart_image(df, chart_path, f"{ticker} - {row.name}")
-            
-            analysis = gemini_svc.analyze([chart_path], df.tail(10).to_csv(), ticker, prompt)
-            print(f"\n--- Analysis for {ticker} ---\n{analysis}\n")
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze {ticker}: {e}")
+    return data
 
 if __name__ == "__main__":
     main()

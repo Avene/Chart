@@ -1,7 +1,7 @@
 import json
 import logging
 import io
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any, TypeVar
 from enum import Enum
 
 import requests
@@ -19,11 +19,15 @@ class StatusEnum(str, Enum):
     LONG_TERM_HOLD = 'LongTermHold'
     SHORT_TERM_HOLD = 'ShortTermHold'
 
+class MarketEnum(str, Enum):
+    US = 'US'
+    JP = 'JP'
+
 class WatchlistRow(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     ticker: str = Field(alias='Ticker', default="")
-    market: str = Field(alias='Market', default="")
+    market: MarketEnum = Field(alias='Market')
     name: str = Field(alias='Name', default="")
     status: StatusEnum = Field(alias='Status')
     route: str = Field(alias='Route', default="")
@@ -38,30 +42,33 @@ class WatchlistRow(BaseModel):
     plan_updated: str = Field(alias='PlanUpdated', default="")
     memo: str = Field(alias='Memo', default="")
 
-class WatchlistRows(list):
-    def us(self) -> "WatchlistRows":
+T = TypeVar("T", bound="WatchlistRow")
+
+class WatchlistRows(list[T]):
+    def us(self) -> "WatchlistRows[T]":
         return WatchlistRows([r for r in self if r.market.strip().upper() == 'US'])
 
-    def jp(self) -> "WatchlistRows":
+    def jp(self) -> "WatchlistRows[T]":
         return WatchlistRows([r for r in self if r.market.strip().upper() == 'JP'])
 
-    def watching(self) -> "WatchlistRows":
+    def watching(self) -> "WatchlistRows[T]":
         return WatchlistRows([r for r in self if r.status == StatusEnum.WATCHING])
 
-    def long_term_hold(self) -> "WatchlistRows":
+    def long_term_hold(self) -> "WatchlistRows[T]":
         return WatchlistRows([r for r in self if r.status == StatusEnum.LONG_TERM_HOLD])
 
-    def short_term_hold(self) -> "WatchlistRows":
+    def short_term_hold(self) -> "WatchlistRows[T]":
         return WatchlistRows([r for r in self if r.status == StatusEnum.SHORT_TERM_HOLD])
 
 class WatchlistData(BaseModel):
-    stocks: List[WatchlistRow]
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    stocks: WatchlistRows[WatchlistRow]
     headers: List[str]
     indices: Dict[str, int]
 
-    @field_validator('stocks', mode='after')
+    @field_validator('stocks', mode='before')
     @classmethod
-    def _validate_rows(cls, v: List[WatchlistRow]) -> WatchlistRows:
+    def _validate_rows(cls, v: Any) -> WatchlistRows:
         return WatchlistRows(v)
 
     def to_sheet_values(self) -> List[List[str]]:
@@ -78,9 +85,9 @@ class GoogleService:
         'https://www.googleapis.com/auth/spreadsheets',
     ]
 
-    def __init__(self, sa_json: Optional[str]):
+    def __init__(self, sa_json: str | None):
         self.sa_json = sa_json
-        self._creds: Optional[Credentials] = None
+        self._creds: Credentials | None = None
 
     def _get_credentials(self) -> Credentials:
         if self._creds and self._creds.valid:
@@ -202,7 +209,7 @@ class GoogleService:
             logger.exception(f"Failed to get values from '{range_name}': {e}")
             return []
 
-    def load_watchlist(self, spreadsheet_id: str, sheet_name: str) -> Optional[WatchlistData]:
+    def load_watchlist(self, spreadsheet_id: str, sheet_name: str) -> WatchlistData | None:
         logger.info(f"Reading {sheet_name} from {spreadsheet_id}...")
         rows = self.get_sheet_values(spreadsheet_id, sheet_name)
         
