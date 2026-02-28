@@ -25,7 +25,7 @@ class AppConfig:
     REPORT_SPREADSHEET_ID: str
     
     @classmethod
-    def from_env(cls):
+    def from_env(cls) -> "AppConfig":
         load_dotenv()
         return cls(
             GEMINI_API_KEY=os.getenv('GEMINI_API_KEY', ''),

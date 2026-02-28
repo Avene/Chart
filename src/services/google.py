@@ -23,7 +23,7 @@ class MarketEnum(str, Enum):
     US = 'US'
     JP = 'JP'
 
-class WatchlistRow(BaseModel):
+class WatchlistItem(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     ticker: str = Field(alias='Ticker', default="")
@@ -42,7 +42,7 @@ class WatchlistRow(BaseModel):
     plan_updated: str = Field(alias='PlanUpdated', default="")
     memo: str = Field(alias='Memo', default="")
 
-T = TypeVar("T", bound="WatchlistRow")
+T = TypeVar("T", bound="WatchlistItem")
 
 class WatchlistRows(list[T]):
     def us(self) -> "WatchlistRows[T]":
@@ -62,7 +62,7 @@ class WatchlistRows(list[T]):
 
 class WatchlistData(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    stocks: WatchlistRows[WatchlistRow]
+    stocks: WatchlistRows[WatchlistItem]
     headers: List[str]
     indices: Dict[str, int]
 
@@ -173,7 +173,7 @@ class GoogleService:
         
         return [{'code': default_code, 'market': 'JP'}]
 
-    def setup_summary_sheet(self, spreadsheet_id: str, new_title: str = "Summary"):
+    def setup_summary_sheet(self, spreadsheet_id: str, new_title: str = "Summary") -> None:
         """Renames the default first sheet (ID 0) to the given title."""
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
         headers = self.get_auth_headers()
@@ -185,7 +185,7 @@ class GoogleService:
         except Exception as e:
             logger.warning(f"Failed to rename summary sheet: {e}")
 
-    def add_sheet(self, spreadsheet_id: str, title: str):
+    def add_sheet(self, spreadsheet_id: str, title: str) -> None:
         """Adds a new sheet (tab) to the spreadsheet."""
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
         headers = self.get_auth_headers()
@@ -224,7 +224,7 @@ class GoogleService:
             r_padded = r + [""] * (len(headers) - len(r))
             row_dict = dict(zip(headers, r_padded))
             try:
-                data_rows.append(WatchlistRow(**row_dict))
+                data_rows.append(WatchlistItem(**row_dict))
             except ValidationError as e:
                 logger.warning(f"Skipping row due to validation error: {row_dict.get('Ticker', 'Unknown')} - {e}")
                 continue
@@ -259,7 +259,7 @@ class GoogleService:
             indices=indices,
         )
 
-    def update_sheet_values(self, spreadsheet_id: str, sheet_name: str, values: List[List[str]]):
+    def update_sheet_values(self, spreadsheet_id: str, sheet_name: str, values: List[List[str]]) -> None:
         """Writes values to the specified sheet starting at A1."""
         safe_title = "".join(c for c in sheet_name if c not in r"*?:/\[\]").strip()[:31]
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/'{safe_title}'!A1?valueInputOption=USER_ENTERED"

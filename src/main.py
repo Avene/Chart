@@ -1,19 +1,21 @@
+from dataclasses import dataclass
 import os
 import logging
 import concurrent.futures
 import pandas as pd
+from typing import Dict
 
 from config import AppConfig
-from services.google import GoogleService
+from services.google import GoogleService, WatchlistData, WatchlistItem
 from services.market import JQuantsService, YFinanceService
-from services.analysis import ChartService, GeminiService
+from services.analysis import ChartService, GeminiService, StockAsset
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 # --- Main Workflow ---
 
-def main():
+def main() -> None:
     # Load Config
     config = AppConfig.from_env()
     
@@ -39,19 +41,30 @@ def main():
     
     # --- Pre-generate Charts ---
     logger.info("Generating charts for all target stocks...")
-    stock_assets = generate_stock_assets(data.stocks, jq_svc, yf_svc)
+    ChartService.clear_output_dir('output')
+
+    stock_assets_short_term = ChartService.generate_stock_assets(data.stocks.short_term_hold(), jq_svc, yf_svc)
+    stock_assets_long_term = ChartService.generate_stock_assets(data.stocks.long_term_hold(), jq_svc, yf_svc)
+    stock_assets_watching = ChartService.generate_stock_assets(data.stocks.watching(), jq_svc, yf_svc)
 
     # --- Analysis ---
     analysis_groups = [
-        (data.stocks.short_term_hold(), config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "Analyze this chart for a short-term trade setup.", "short_term"),
-        (data.stocks.long_term_hold(), config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM, "Analyze this chart for a long-term investment.", "long_term"),
-        (data.stocks.watching(), config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "Analyze this chart to see if it is worth watching.", "watching"),
+        (stock_assets_short_term, config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "short_term"),
+        (stock_assets_long_term, config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM,  "long_term"),
+        (stock_assets_watching, config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "watching"),
     ]
 
-    for stocks, prompt_uri, checklist_uri, default_prompt, key_suffix in analysis_groups:
-        analyze_stocks(stocks, stock_assets, prompt_uri, checklist_uri, default_prompt, google_svc, gemini_svc, key_suffix)
+    for assets, prompt_uri, checklist_uri, key_suffix in analysis_groups:
+        analyze_stocks(assets, prompt_uri, checklist_uri, google_svc, gemini_svc, key_suffix)
             
-def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
+def update_prices(
+    google_svc: GoogleService, 
+    jq_svc: JQuantsService, 
+    yf_svc: YFinanceService, 
+    sid: str, 
+    sheet_name: str, 
+    data: WatchlistData
+) -> WatchlistData:
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # --- Process US Stocks in Bulk ---
@@ -75,7 +88,7 @@ def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
                 row.price_updated = now_str
 
     # --- Process JP Stocks concurrently ---
-    def fetch_jp_data(row):
+    def fetch_jp_data(row: WatchlistItem) -> None:
         ticker = row.ticker
         if not ticker: return
         
@@ -102,58 +115,32 @@ def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     logger.info("Done.")
     return data
 
-def generate_stock_assets(stocks, jq_svc, yf_svc):
-    ChartService.clear_output_dir('output')
 
-    assets = {}
-    for row in stocks:
-        ticker = row.ticker
-        try:
-            df = pd.DataFrame()
-            match row.market:
-                case 'US':
-                    df = yf_svc.get_daily_prices(ticker, days=1825)
-                case 'JP':
-                    df = jq_svc.get_daily_prices(ticker, days=1825)
-                        
-            if df.empty:
-                logger.warning(f"No data for {ticker}")
-                continue
 
-            chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
-            assets[ticker] = {
-                'paths': chart_paths,
-                'csv': df_daily.tail(100).to_csv()
-            }
-        except Exception as e:
-            logger.error(f"Failed to generate assets for {ticker}: {e}")
-    return assets
-
-def analyze_stocks(stocks, assets, prompt_uri, checklist_uri, default_prompt, google_svc, gemini_svc, cache_key_suffix):
-    if not stocks:
+def analyze_stocks(
+    assets: Dict[str, StockAsset], 
+    prompt_uri: str, 
+    checklist_uri: str, 
+    google_svc: GoogleService, 
+    gemini_svc: GeminiService, 
+    cache_key_suffix: str
+) -> None:
+    if not assets:
         return
 
-    logger.info(f"Starting analysis for {len(stocks)} stocks ({cache_key_suffix})...")
+    logger.info(f"Starting analysis for {len(assets)} stocks ({cache_key_suffix})...")
     
-    prompt = default_prompt
-    if prompt_uri:
-        p = google_svc.fetch_text_content(prompt_uri)
-        if p: prompt = p
+    prompt = google_svc.fetch_text_content(prompt_uri)
 
     checklist_str = None
     if checklist_uri:
         checklist_str = google_svc.fetch_text_content(checklist_uri)
     
-    cache_name = gemini_svc.setup_cache(prompt, checklist_str, cache_key=f"chart_analysis_{cache_key_suffix}")
-
-    for row in stocks:
-        ticker = row.ticker
-        if ticker not in assets:
-            continue
-            
-        asset = assets[ticker]
+    # TODO  Consider caching prompt and checklist content if the same URIs are used across groups to avoid redundant fetches
+    for asset in assets.values():
+        ticker = asset.watchlist_item.ticker
         try:
-            analysis = gemini_svc.analyze(asset['paths'], asset['csv'], ticker, prompt, checklist_str, cached_content=cache_name)
+            analysis = gemini_svc.analyze(asset, prompt, checklist_str)
             print(f"\n--- Analysis for {ticker} ({cache_key_suffix}) ---\n{analysis}\n")
             
         except Exception as e:
