@@ -7,6 +7,8 @@ api_keys.txt
 __pycache__/
 *.py[cod]
 *$py.class
+.mypy_cache/
+.pytest_cache/
 
 # --- 仮想環境 (サイズが巨大なので除外) ---
 .venv/
