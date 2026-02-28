@@ -39,18 +39,13 @@ def main():
     
     # --- Pre-generate Charts ---
     logger.info("Generating charts for all target stocks...")
-    short_term = data.stocks.short_term_hold()
-    long_term = data.stocks.long_term_hold()
-    watching = data.stocks.watching()
-    
-    unique_stocks = {s.ticker: s for s in short_term + long_term + watching}
-    stock_assets = generate_stock_assets(list(unique_stocks.values()), jq_svc, yf_svc)
+    stock_assets = generate_stock_assets(data.stocks, jq_svc, yf_svc)
 
     # --- Analysis ---
     analysis_groups = [
-        (short_term, config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "Analyze this chart for a short-term trade setup.", "short_term"),
-        (long_term, config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM, "Analyze this chart for a long-term investment.", "long_term"),
-        (watching, config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "Analyze this chart to see if it is worth watching.", "watching"),
+        (data.stocks.short_term_hold(), config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "Analyze this chart for a short-term trade setup.", "short_term"),
+        (data.stocks.long_term_hold(), config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM, "Analyze this chart for a long-term investment.", "long_term"),
+        (data.stocks.watching(), config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "Analyze this chart to see if it is worth watching.", "watching"),
     ]
 
     for stocks, prompt_uri, checklist_uri, default_prompt, key_suffix in analysis_groups:
@@ -128,7 +123,7 @@ def generate_stock_assets(stocks, jq_svc, yf_svc):
             chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
             assets[ticker] = {
                 'paths': chart_paths,
-                'csv': df_daily.tail(10).to_csv()
+                'csv': df_daily.tail(100).to_csv()
             }
         except Exception as e:
             logger.error(f"Failed to generate assets for {ticker}: {e}")
