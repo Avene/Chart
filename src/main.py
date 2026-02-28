@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 # --- Main Workflow ---
 
 def main():
-    os.makedirs('output', exist_ok=True)
     # Load Config
     config = AppConfig.from_env()
     
@@ -36,44 +35,26 @@ def main():
     # 2. Process rows
     data = update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data)
 
-    # --- Analysis for Short Term Hold ---
-    short_term_stocks = data.stocks.short_term_hold()
-    if not short_term_stocks:
-        return
-
-    logger.info(f"Starting analysis for {len(short_term_stocks)} short-term hold stocks...")
     gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
     
-    prompt = "Analyze this chart for a short-term trade setup."
-    if config.PROMPT_URI:
-        p = google_svc.fetch_text_content(config.PROMPT_URI)
-        if p: prompt = p
+    # --- Pre-generate Charts ---
+    logger.info("Generating charts for all target stocks...")
+    short_term = data.stocks.short_term_hold()
+    long_term = data.stocks.long_term_hold()
+    watching = data.stocks.watching()
+    
+    unique_stocks = {s.ticker: s for s in short_term + long_term + watching}
+    stock_assets = generate_stock_assets(list(unique_stocks.values()), jq_svc, yf_svc)
 
-    checklist_str = google_svc.fetch_text_content(config.CHECKLIST_URI)
-    cache_name = gemini_svc.setup_cache(prompt, checklist_str)
+    # --- Analysis ---
+    analysis_groups = [
+        (short_term, config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "Analyze this chart for a short-term trade setup.", "short_term"),
+        (long_term, config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM, "Analyze this chart for a long-term investment.", "long_term"),
+        (watching, config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "Analyze this chart to see if it is worth watching.", "watching"),
+    ]
 
-    for row in short_term_stocks:
-        ticker = row.ticker
-        market = row.market.strip().upper()
-        
-        try:
-            df = pd.DataFrame()
-            match row.market:
-                case 'US':
-                    df = yf_svc.get_daily_prices(ticker, days=1825)
-                case 'JP':
-                    df = jq_svc.get_daily_prices(ticker, days=1825)
-                        
-            if df.empty:
-                logger.warning(f"No data for {ticker}")
-                continue
-
-            chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
-            analysis = gemini_svc.analyze(chart_paths, df_daily.tail(10).to_csv(), ticker, prompt, checklist_str, cached_content=cache_name)
-            print(f"\n--- Analysis for {ticker} ---\n{analysis}\n")
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze {ticker}: {e}")
+    for stocks, prompt_uri, checklist_uri, default_prompt, key_suffix in analysis_groups:
+        analyze_stocks(stocks, stock_assets, prompt_uri, checklist_uri, default_prompt, google_svc, gemini_svc, key_suffix)
             
 def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -125,6 +106,63 @@ def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
     return data
+
+def generate_stock_assets(stocks, jq_svc, yf_svc):
+    ChartService.clear_output_dir('output')
+
+    assets = {}
+    for row in stocks:
+        ticker = row.ticker
+        try:
+            df = pd.DataFrame()
+            match row.market:
+                case 'US':
+                    df = yf_svc.get_daily_prices(ticker, days=1825)
+                case 'JP':
+                    df = jq_svc.get_daily_prices(ticker, days=1825)
+                        
+            if df.empty:
+                logger.warning(f"No data for {ticker}")
+                continue
+
+            chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
+            assets[ticker] = {
+                'paths': chart_paths,
+                'csv': df_daily.tail(10).to_csv()
+            }
+        except Exception as e:
+            logger.error(f"Failed to generate assets for {ticker}: {e}")
+    return assets
+
+def analyze_stocks(stocks, assets, prompt_uri, checklist_uri, default_prompt, google_svc, gemini_svc, cache_key_suffix):
+    if not stocks:
+        return
+
+    logger.info(f"Starting analysis for {len(stocks)} stocks ({cache_key_suffix})...")
+    
+    prompt = default_prompt
+    if prompt_uri:
+        p = google_svc.fetch_text_content(prompt_uri)
+        if p: prompt = p
+
+    checklist_str = None
+    if checklist_uri:
+        checklist_str = google_svc.fetch_text_content(checklist_uri)
+    
+    cache_name = gemini_svc.setup_cache(prompt, checklist_str, cache_key=f"chart_analysis_{cache_key_suffix}")
+
+    for row in stocks:
+        ticker = row.ticker
+        if ticker not in assets:
+            continue
+            
+        asset = assets[ticker]
+        try:
+            analysis = gemini_svc.analyze(asset['paths'], asset['csv'], ticker, prompt, checklist_str, cached_content=cache_name)
+            print(f"\n--- Analysis for {ticker} ({cache_key_suffix}) ---\n{analysis}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze {ticker}: {e}")
 
 if __name__ == "__main__":
     main()

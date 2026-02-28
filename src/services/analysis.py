@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 import tempfile
 from typing import List, Any, Tuple
 import pandas as pd
@@ -13,6 +14,12 @@ logger = logging.getLogger(__name__)
 class ChartService:
     """Handles Technical Analysis and Chart Plotting."""
     
+    @staticmethod
+    def clear_output_dir(output_dir: str):
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
     @staticmethod
     def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         if df.empty: return df
@@ -51,11 +58,15 @@ class ChartService:
     @staticmethod
     def create_chart_image(df: pd.DataFrame, filename: str, title: str) -> str:
         if df.empty: return ""
+
+        # Custom Style: Black bg, Red Up, Green Down
+        mc = mpf.make_marketcolors(up='red', down='green', edge='inherit', wick='inherit', volume='in')
+        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc, facecolor='black', figcolor='black', gridcolor='#333333')
         
         ap = []
         # MA
         ma_cols = sorted([c for c in df.columns if c.startswith('MA')], key=lambda x: int(x[2:]))
-        colors = ['orange', 'blue', 'green']
+        colors = ['cyan', 'yellow', 'orange']
         for i, col in enumerate(ma_cols):
             if not df[col].isna().all():
                 ap.append(mpf.make_addplot(df[col], color=colors[i % len(colors)], width=1.0))
@@ -72,7 +83,7 @@ class ChartService:
                 ap.append(mpf.make_addplot(df[low], color=color, **style))
 
         kwargs = {'addplot': ap} if ap else {}
-        mpf.plot(df, type='candle', volume=True, style='yahoo', savefig=filename, title=title, **kwargs)
+        mpf.plot(df, type='candle', volume=True, style=s, savefig=filename, title=title, **kwargs)
         logger.info(f"✅ Chart saved: {filename}")
         return filename
 
@@ -131,12 +142,12 @@ class GeminiService:
             config={'display_name': cache_key, 'ttl': f'{ttl_minutes}m'}
         ).name
 
-    def setup_cache(self, prompt: str, checklist_content: str | None, ttl_minutes: int = 10) -> str | None:
+    def setup_cache(self, prompt: str, checklist_content: str | None, cache_key: str = "chart_analysis_context", ttl_minutes: int = 10) -> str | None:
         try:
             contents = [prompt]
             if checklist_content:
                 contents.append(checklist_content)
-            return self.get_or_create_cache("chart_analysis_context", contents, ttl_minutes)
+            return self.get_or_create_cache(cache_key, contents, ttl_minutes)
         except Exception as e:
             logger.warning(f"Cache setup failed: {e}")
             return None
