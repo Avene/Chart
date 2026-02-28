@@ -1,6 +1,7 @@
 import os
 import logging
 import tempfile
+import concurrent.futures
 from typing import List, Any, Tuple
 import pandas as pd
 import matplotlib
@@ -144,7 +145,11 @@ class GeminiService:
 
     def analyze(self, image_paths: List[str], csv_data: str, csv_prefix: str, prompt: str, checklist_content: str | None, cached_content: str | None = None) -> WatchlistRowWritable:
         try:
-            imgs = [self.client.files.upload(file=p, config={'http_options': {'timeout': self.timeout_ms}}) for p in image_paths]
+            def upload_file(path):
+                return self.client.files.upload(file=path, config={'http_options': {'timeout': self.timeout_ms}})
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                imgs = list(executor.map(upload_file, image_paths))
             
             csv_file = None
             if csv_data:
