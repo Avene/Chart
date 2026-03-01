@@ -8,7 +8,7 @@ from typing import Dict
 from config import AppConfig
 from services.google import GoogleService, WatchlistData, WatchlistItem
 from services.market import JQuantsService, YFinanceService
-from services.analysis import ChartService, GeminiService, StockAsset
+from services.analysis import ChartService, GeminiService, StockAnalysisAsset
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,8 +54,19 @@ def main() -> None:
         (stock_assets_watching, config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "watching"),
     ]
 
-    for assets, prompt_uri, checklist_uri, key_suffix in analysis_groups:
-        analyze_stocks(assets, prompt_uri, checklist_uri, google_svc, gemini_svc, key_suffix)
+    def process_group(assets: Dict[str, StockAnalysisAsset], prompt_uri: str, checklist_uri: str, key_suffix: str) -> None:
+        if not assets: return
+        prompt_text = google_svc.fetch_text_content(prompt_uri)
+        checklist_text = google_svc.fetch_text_content(checklist_uri) if checklist_uri else None
+        gemini_svc.analyze_stocks(assets, prompt_text, checklist_text, key_suffix)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(process_group, *group) for group in analysis_groups]
+        concurrent.futures.wait(futures)
+
+    logger.info("All analyses complete. Writing final results back to sheet...")
+    google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
+    logger.info("Analysis complete.")
             
 def update_prices(
     google_svc: GoogleService, 
@@ -114,49 +125,6 @@ def update_prices(
     google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
     return data
-
-
-
-def analyze_stocks(
-    assets: Dict[str, StockAsset], 
-    prompt_uri: str, 
-    checklist_uri: str, 
-    google_svc: GoogleService, 
-    gemini_svc: GeminiService, 
-    cache_key_suffix: str
-) -> None:
-    if not assets:
-        return
-
-    logger.info(f"Starting analysis for {len(assets)} stocks ({cache_key_suffix})...")
-    
-    prompt = google_svc.fetch_text_content(prompt_uri)
-
-    checklist_str = None
-    if checklist_uri:
-        checklist_str = google_svc.fetch_text_content(checklist_uri)
-    
-    # TODO  Consider caching prompt and checklist content if the same URIs are used across groups to avoid redundant fetches
-    for asset in assets.values():
-        ticker = asset.watchlist_item.ticker
-        try:
-            analysis = gemini_svc.analyze(asset, prompt, checklist_str)
-            
-            asset.watchlist_item.score = analysis.score
-            asset.watchlist_item.action_plan = analysis.action_plan
-            asset.watchlist_item.loss_cut_target = analysis.loss_cut_target
-            asset.watchlist_item.entry_target = analysis.entry_target
-            asset.watchlist_item.profit_take_target = analysis.profit_take_target
-            asset.watchlist_item.comment = analysis.comment
-            asset.watchlist_item.memo = analysis.memo
-            asset.watchlist_item.plan_updated = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            print(f"\n--- Analysis for {ticker} ---\n{analysis.comment}\n")            
-        except Exception as e:
-            logger.error(f"Failed to analyze {ticker}: {e}")
-    # logger.info("Writing analysis results back to sheet...")
-    # google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
-    # logger.info("Analysis complete.")
 
 if __name__ == "__main__":
     main()

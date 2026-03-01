@@ -51,7 +51,7 @@ class WatchlistItem(BaseModel):
     plan_updated: str = Field(alias='PlanUpdated', default="")
     memo: str = Field(alias='Memo', default="")
 
-class WatchlistRowWritable(WatchlistItem):
+class WatchlistItemWritable(WatchlistItem):
     model_config = ConfigDict(populate_by_name=True, extra='ignore')
 
     @classmethod

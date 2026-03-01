@@ -1,27 +1,26 @@
 from dataclasses import dataclass
 import os
+import concurrent.futures
 import logging
 import shutil
 import tempfile
-import concurrent.futures
 from typing import List, Any, Tuple, Dict
 import pandas as pd
 import matplotlib
 
-from services.google import WatchlistItem, WatchlistRows
+from services.google import WatchlistItem, WatchlistItemWritable, WatchlistRows
 from services.market import JQuantsService, YFinanceService
 
 matplotlib.use('Agg')
 import mplfinance as mpf
 from google import genai
-from services.google import WatchlistRowWritable
 from google.genai.types import ContentListUnionDict, File, GenerateContentConfigOrDict
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class StockAsset:
+class StockAnalysisAsset:
     paths: List[str]
     last_100_pricing_data_csv: str
     watchlist_item: WatchlistItem
@@ -34,9 +33,9 @@ class ChartService:
         stocks: WatchlistRows[WatchlistItem], 
         jq_svc: JQuantsService, 
         yf_svc: YFinanceService
-    ) -> Dict[str, StockAsset]:
+    ) -> Dict[str, StockAnalysisAsset]:
 
-        assets: Dict[str, StockAsset] = {}
+        assets: Dict[str, StockAnalysisAsset] = {}
         for row in stocks:
             ticker = row.ticker
             try:
@@ -52,7 +51,7 @@ class ChartService:
                     continue
 
                 chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
-                assets[ticker] = StockAsset(
+                assets[ticker] = StockAnalysisAsset(
                     paths=chart_paths,
                     last_100_pricing_data_csv=df_daily.tail(100).to_csv(),
                     watchlist_item=row
@@ -174,23 +173,29 @@ class GeminiService:
         logger.info(f"Generating content with model {self.model_name}")
         return self.client.models.generate_content(model=self.model_name, contents=contents, config=config)
 
-    def analyze(self, asset: StockAsset, prompt: str, checklist_content: str | None) -> WatchlistRowWritable:
+    def analyze(self, asset: StockAnalysisAsset, prompt: str, checklist_content: str | None) -> WatchlistItemWritable:
         image_paths = asset.paths
         price_history_data = asset.last_100_pricing_data_csv
 
+        tmp_path = None
         try:
-            chart_imgs = [self.client.files.upload(file=p, config={'http_options': {'timeout': self.timeout_ms}}) for p in image_paths]
-            
-            price_history_csv = None
             if price_history_data:
                 with tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix=asset.watchlist_item.ticker, suffix='.csv', encoding='utf-8') as tmp:
                     tmp.write(price_history_data)
                     tmp_path = tmp.name
-                try:
-                    price_history_csv = self.client.files.upload(file=tmp_path, config={'mime_type': 'text/csv', 'http_options': {'timeout': self.timeout_ms}})
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+
+            def upload_helper(path: str, mime_type: str | None = None):
+                config = {'http_options': {'timeout': self.timeout_ms}}
+                if mime_type:
+                    config['mime_type'] = mime_type
+                return self.client.files.upload(file=path, config=config)
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                img_futures = [executor.submit(upload_helper, p) for p in image_paths]
+                csv_future = executor.submit(upload_helper, tmp_path, 'text/csv') if tmp_path else None
+                
+                chart_imgs = [f.result() for f in img_futures]
+                price_history_csv = csv_future.result() if csv_future else None
 
             contents: List[str | File] = []
             contents.append(prompt)            
@@ -202,28 +207,57 @@ class GeminiService:
             if checklist_content:
                 contents.append(checklist_content)
 
-            response = self._generate(contents, config=None)
             config = {
                 'response_mime_type': 'application/json',
-                'response_schema': WatchlistRowWritable
+                'response_schema': WatchlistItemWritable
             }
 
             response = self._generate(contents, config=config)
-            
+
             if response.usage_metadata:
                 logger.info(f"Gemini Usage: {response.usage_metadata}")
-            return WatchlistRowWritable.model_validate_json(response.text)
+
+            return WatchlistItemWritable.model_validate_json(response.text)
+
         except Exception as e:
             logger.exception(f"Gemini Analysis Failed: {e}")
-            return WatchlistRowWritable(Comment="Error during analysis.")
+            return WatchlistItemWritable(Comment="Error during analysis.")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
-    def summarize(self, results: List[str], prompt: str) -> str:
-        try:
-            combined_text = "\n\n---\n\n".join(results)
-            response = self._generate([prompt, combined_text])
-            if response.usage_metadata:
-                logger.info(f"Gemini Usage: {response.usage_metadata}")
-            return response.text
-        except Exception as e:
-            logger.exception(f"Gemini Summary Failed: {e}")
-            return "Error during summary."
+    def analyze_stocks(
+        self,
+        assets: Dict[str, StockAnalysisAsset], 
+        prompt: str, 
+        checklist_content: str | None, 
+        cache_key_suffix: str
+    ) -> None:
+        if not assets:
+            return
+
+        logger.info(f"Starting analysis for {len(assets)} stocks ({cache_key_suffix})...")
+        
+        def process_asset(asset: StockAnalysisAsset) -> None:
+            ticker = asset.watchlist_item.ticker
+            try:
+                analysis = self.analyze(asset, prompt, checklist_content)
+                
+                asset.watchlist_item.score = analysis.score
+                asset.watchlist_item.action_plan = analysis.action_plan
+                asset.watchlist_item.loss_cut_target = analysis.loss_cut_target
+                asset.watchlist_item.entry_target = analysis.entry_target
+                asset.watchlist_item.profit_take_target = analysis.profit_take_target
+                asset.watchlist_item.comment = analysis.comment
+                asset.watchlist_item.memo = analysis.memo
+                asset.watchlist_item.plan_updated = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                print(f"\n--- Analysis for {ticker} ---\n{analysis.comment}\n")            
+            except Exception as e:
+                logger.error(f"Failed to analyze {ticker}: {e}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(process_asset, asset) for asset in assets.values()]
+            concurrent.futures.wait(futures)
+
+        logger.info(f"Finished analysis for {len(assets)} stocks ({cache_key_suffix}).")
