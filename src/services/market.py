@@ -14,7 +14,7 @@ class JQuantsService:
     """Handles J-Quants API interactions."""
     BASE_URL = "https://api.jquants.com/v2"
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str) -> None:
         self.headers = {'x-api-key': api_key}
 
     def get_daily_prices(self, code: str, days: int = 1825) -> pd.DataFrame:

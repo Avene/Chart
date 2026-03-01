@@ -1,20 +1,21 @@
+from dataclasses import dataclass
 import os
 import logging
 import concurrent.futures
 import pandas as pd
+from typing import Dict
 
 from config import AppConfig
-from services.google import GoogleService
+from services.google import GoogleService, WatchlistData, WatchlistItem
 from services.market import JQuantsService, YFinanceService
-from services.analysis import ChartService, GeminiService
+from services.analysis import ChartService, GeminiService, StockAsset
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 # --- Main Workflow ---
 
-def main():
-    os.makedirs('output', exist_ok=True)
+def main() -> None:
     # Load Config
     config = AppConfig.from_env()
     
@@ -36,59 +37,34 @@ def main():
     # 2. Process rows
     data = update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data)
 
-    # --- Analysis for Short Term Hold ---
-    short_term_stocks = data.stocks.short_term_hold()
-    if not short_term_stocks:
-        return
-
-    logger.info(f"Starting analysis for {len(short_term_stocks)} short-term hold stocks...")
     gemini_svc = GeminiService(config.GEMINI_API_KEY, config.GEMINI_MODEL_NAME)
     
-    prompt = "Analyze this chart for a short-term trade setup."
-    if config.PROMPT_URI:
-        p = google_svc.fetch_text_content(config.PROMPT_URI)
-        if p: prompt = p
+    # --- Pre-generate Charts ---
+    logger.info("Generating charts for all target stocks...")
+    ChartService.clear_output_dir('output')
 
-    checklist_str = google_svc.fetch_text_content(config.CHECKLIST_URI)
-    cache_name = gemini_svc.setup_cache(prompt, checklist_str)
+    stock_assets_short_term = ChartService.generate_stock_assets(data.stocks.short_term_hold(), jq_svc, yf_svc)
+    stock_assets_long_term = ChartService.generate_stock_assets(data.stocks.long_term_hold(), jq_svc, yf_svc)
+    stock_assets_watching = ChartService.generate_stock_assets(data.stocks.watching(), jq_svc, yf_svc)
 
-    for row in short_term_stocks:
-        ticker = row.ticker        
-        try:
-            df = pd.DataFrame()
-            match row.market:
-                case 'US':
-                    df = yf_svc.get_daily_prices(ticker, days=1825)
-                case 'JP':
-                    df = jq_svc.get_daily_prices(ticker, days=1825)
-                        
-            if df.empty:
-                logger.warning(f"No data for {ticker}")
-                continue
+    # --- Analysis ---
+    analysis_groups = [
+        (stock_assets_short_term, config.PROMPT_URI_SHORT_TERM, config.CHECKLIST_URI_SHORT_TERM, "short_term"),
+        (stock_assets_long_term, config.PROMPT_URI_LONG_TERM, config.CHECKLIST_URI_LONG_TERM,  "long_term"),
+        (stock_assets_watching, config.PROMPT_URI_WATCHING, config.CHECKLIST_URI_WATCHING, "watching"),
+    ]
 
-            chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
-            analysis = gemini_svc.analyze(chart_paths, df_daily.tail(90).to_csv(), ticker, prompt, checklist_str, cached_content=cache_name)
+    for assets, prompt_uri, checklist_uri, key_suffix in analysis_groups:
+        analyze_stocks(assets, prompt_uri, checklist_uri, google_svc, gemini_svc, key_suffix)
             
-            row.score = analysis.score
-            row.action_plan = analysis.action_plan
-            row.loss_cut_target = analysis.loss_cut_target
-            row.entry_target = analysis.entry_target
-            row.profit_take_target = analysis.profit_take_target
-            row.comment = analysis.comment
-            row.memo = analysis.memo
-            row.plan_updated = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            print(f"\n--- Analysis for {ticker} ---\n{analysis.comment}\n")
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze {ticker}: {e}")
-            return
-            
-    logger.info("Writing analysis results back to sheet...")
-    google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
-    logger.info("Analysis complete.")
-
-def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
+def update_prices(
+    google_svc: GoogleService, 
+    jq_svc: JQuantsService, 
+    yf_svc: YFinanceService, 
+    sid: str, 
+    sheet_name: str, 
+    data: WatchlistData
+) -> WatchlistData:
     now_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # --- Process US Stocks in Bulk ---
@@ -112,7 +88,7 @@ def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
                 row.price_updated = now_str
 
     # --- Process JP Stocks concurrently ---
-    def fetch_jp_data(row):
+    def fetch_jp_data(row: WatchlistItem) -> None:
         ticker = row.ticker
         if not ticker: return
         
@@ -138,6 +114,49 @@ def update_prices(google_svc, jq_svc, yf_svc, sid, sheet_name, data):
     google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
     logger.info("Done.")
     return data
+
+
+
+def analyze_stocks(
+    assets: Dict[str, StockAsset], 
+    prompt_uri: str, 
+    checklist_uri: str, 
+    google_svc: GoogleService, 
+    gemini_svc: GeminiService, 
+    cache_key_suffix: str
+) -> None:
+    if not assets:
+        return
+
+    logger.info(f"Starting analysis for {len(assets)} stocks ({cache_key_suffix})...")
+    
+    prompt = google_svc.fetch_text_content(prompt_uri)
+
+    checklist_str = None
+    if checklist_uri:
+        checklist_str = google_svc.fetch_text_content(checklist_uri)
+    
+    # TODO  Consider caching prompt and checklist content if the same URIs are used across groups to avoid redundant fetches
+    for asset in assets.values():
+        ticker = asset.watchlist_item.ticker
+        try:
+            analysis = gemini_svc.analyze(asset, prompt, checklist_str)
+            
+            asset.watchlist_item.score = analysis.score
+            asset.watchlist_item.action_plan = analysis.action_plan
+            asset.watchlist_item.loss_cut_target = analysis.loss_cut_target
+            asset.watchlist_item.entry_target = analysis.entry_target
+            asset.watchlist_item.profit_take_target = analysis.profit_take_target
+            asset.watchlist_item.comment = analysis.comment
+            asset.watchlist_item.memo = analysis.memo
+            asset.watchlist_item.plan_updated = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            print(f"\n--- Analysis for {ticker} ---\n{analysis.comment}\n")            
+        except Exception as e:
+            logger.error(f"Failed to analyze {ticker}: {e}")
+    # logger.info("Writing analysis results back to sheet...")
+    # google_svc.update_sheet_values(sid, sheet_name, data.to_sheet_values())
+    # logger.info("Analysis complete.")
 
 if __name__ == "__main__":
     main()
