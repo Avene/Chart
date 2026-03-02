@@ -36,11 +36,11 @@ class ChartService:
     ) -> Dict[str, StockAnalysisAsset]:
 
         assets: Dict[str, StockAnalysisAsset] = {}
-        for row in stocks:
-            ticker = row.ticker
+        for watch_list_item in stocks:
+            ticker = watch_list_item.ticker
             try:
                 df = pd.DataFrame()
-                match row.market:
+                match watch_list_item.market:
                     case 'US':
                         df = yf_svc.get_daily_prices(ticker, days=1825)
                     case 'JP':
@@ -50,11 +50,11 @@ class ChartService:
                     logger.warning(f"No data for {ticker}")
                     continue
 
-                chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output')
+                chart_paths, df_daily = ChartService.generate_charts(ticker, df, 'output', watch_list_item.name)
                 assets[ticker] = StockAnalysisAsset(
                     paths=chart_paths,
                     last_100_pricing_data_csv=df_daily.tail(100).to_csv(),
-                    watchlist_item=row
+                    watchlist_item=watch_list_item
                 )
             except Exception as e:
                 logger.error(f"Failed to generate assets for {ticker}: {e}")
@@ -135,7 +135,7 @@ class ChartService:
         return filename
 
     @staticmethod
-    def generate_charts(ticker: str, df: pd.DataFrame, output_dir: str) -> Tuple[List[str], pd.DataFrame]:
+    def generate_charts(ticker: str, df: pd.DataFrame, output_dir: str, company_name: str = "") -> Tuple[List[str], pd.DataFrame]:
         """Generates Daily, Weekly, and Monthly charts and returns paths and the daily DataFrame."""
         # Prepare DataFrames
         df_daily = ChartService.add_indicators(df.copy(), periods=[5, 25, 75])
@@ -145,17 +145,17 @@ class ChartService:
         paths = []
         # Daily: Last ~9 months (180 bars)
         path_d = os.path.join(output_dir, f"{ticker}_daily.png")
-        ChartService.create_chart_image(df_daily.tail(180), path_d, f"{ticker} - Daily")
+        ChartService.create_chart_image(df_daily.tail(180), path_d, f"Daily - {ticker} - {company_name}")
         paths.append(path_d)
         
         # Weekly: Last ~3 years (150 bars)
         path_w = os.path.join(output_dir, f"{ticker}_weekly.png")
-        ChartService.create_chart_image(df_weekly.tail(150), path_w, f"{ticker} - Weekly")
+        ChartService.create_chart_image(df_weekly.tail(150), path_w, f"Weekly - {ticker} - {company_name}")
         paths.append(path_w)
         
         # Monthly: Last ~5 years (60 bars)
         path_m = os.path.join(output_dir, f"{ticker}_monthly.png")
-        ChartService.create_chart_image(df_monthly.tail(60), path_m, f"{ticker} - Monthly")
+        ChartService.create_chart_image(df_monthly.tail(60), path_m, f"Monthly - {ticker} - {company_name}")
         paths.append(path_m)
 
         return paths, df_daily
