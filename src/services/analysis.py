@@ -7,6 +7,7 @@ import tempfile
 from typing import List, Any, Tuple, Dict
 import pandas as pd
 import matplotlib
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from services.google import WatchlistItem, WatchlistItemWritable, WatchlistRows
 from services.market import JQuantsService, YFinanceService
@@ -113,13 +114,13 @@ class ChartService:
         ap = []
         # MA
         ma_cols = sorted([c for c in df.columns if c.startswith('MA')], key=lambda x: int(x[2:]))
-        colors = ['cyan', 'yellow', 'orange']
+        colors = ['orange', 'pink', 'white']
         for i, col in enumerate(ma_cols):
             if not df[col].isna().all():
                 ap.append(mpf.make_addplot(df[col], color=colors[i % len(colors)], width=1.0))
         
         # BB
-        bb_colors = {1: "#EFB2D8", 2: "#DC72B5", 3: "#BA358A"}
+        bb_colors = {1: "#B686ED", 2: "#43238C", 3: "#7162F0"}
         style = dict(width=0.6, alpha=0.8, linestyle='dashdot')
         
         for sigma, color in bb_colors.items():
@@ -130,7 +131,17 @@ class ChartService:
                 ap.append(mpf.make_addplot(df[low], color=color, **style))
 
         kwargs = {'addplot': ap} if ap else {}
-        mpf.plot(df, type='candle', volume=True, style=s, savefig=filename, title=title, **kwargs)
+        mpf.plot(
+            df, 
+            type='candle', 
+            volume=True, 
+            style=s, 
+            savefig=dict(fname=filename, bbox_inches='tight'), 
+            title=title, 
+            figsize=(16, 8), 
+            tight_layout=True, 
+            **kwargs
+        )
         logger.info(f"✅ Chart saved: {filename}")
         return filename
 
@@ -168,7 +179,7 @@ class GeminiService:
         self.timeout_ms = 300000
         self.client = genai.Client(api_key=self.api_key, http_options={'timeout': self.timeout_ms})
 
-    # @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
     def _generate(self, contents: ContentListUnionDict, config: GenerateContentConfigOrDict | None = None) -> Any:
         logger.info(f"Generating content with model {self.model_name}")
         return self.client.models.generate_content(model=self.model_name, contents=contents, config=config)
@@ -256,7 +267,7 @@ class GeminiService:
             except Exception as e:
                 logger.error(f"Failed to analyze {ticker}: {e}")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(process_asset, asset) for asset in assets.values()]
             concurrent.futures.wait(futures)
 

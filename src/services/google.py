@@ -20,9 +20,11 @@ class StatusEnum(str, Enum):
     LONG_TERM_HOLD = 'LongTermHold'
     SHORT_TERM_HOLD = 'ShortTermHold'
 
+
 class MarketEnum(str, Enum):
     US = 'US'
     JP = 'JP'
+
 
 class ActionPlanEnum(str, Enum):
     StrongBuy = 'StrongBuy'
